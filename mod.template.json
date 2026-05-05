@@ -1,0 +1,17 @@
+{
+  "_QPVersion": "0.1.1",
+  "id": "${mod_id}",
+  "name": "Vivify",
+  "version": "${version}",
+  "author": "Aeroluna",
+  "modloader": "Scotland2",
+  "packageId": "com.beatgames.beatsaber",
+  "packageVersion": "1.40.8_7379",
+  "coverImage": "cover.png",
+  "description": "Quest port of Vivify for Beat Saber.",
+  "modFiles": [],
+  "lateModFiles": [
+    "${binary}"
+  ],
+  "libraryFiles": []
+}

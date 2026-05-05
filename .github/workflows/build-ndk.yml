@@ -34,8 +34,8 @@ on:
         - 'fix/*'
 
 env:
-    module_id: "#{id}"
-    qmod_name: "#{name}"
+    module_id: "Vivify"
+    qmod_name: "Vivify"
 
 jobs:
   build:

@@ -2,7 +2,7 @@
   "configurations": [
     {
       "defines": [
-        "MOD_ID=\"#{id}\"",
+        "MOD_ID=\"Vivify\"",
         "VERSION=\"0.1.0\"",
         "__GNUC__",
         "__aarch64__"
@@ -15,7 +15,7 @@
         "${workspaceFolder}/shared", 
         "${workspaceFolder}",
         
-        "#{ndkpath}/**",
+        "C:/Users/logan/Downloads/android-ndk-r25c-windows/android-ndk-r25c/**",
         "${default}"
       ],
       "name": "Quest",

@@ -1,4 +1,4 @@
-// Updated VivifyRuntime.cpp with critical null pointer safety fixes.
+// ohio sigma rizzler things
 
 #include <iostream>
 #include <stdexcept>
@@ -8,7 +8,7 @@ void FindAssignedPrefab(void* prefab)
 {
     try {
         auto assignedPrefab = try_cast<PrefabType>(prefab);
-        // Additional logic for working with assignedPrefab.
+        // things
     } catch (const std::exception& e) {
         std::cerr << "Error casting prefab: " << e.what() << std::endl;
     }
@@ -26,7 +26,7 @@ void ReplaceNoteVisuals(NoteTransform* noteTransform)
             std::cerr << "Warning: renderer is null, skipping..." << std::endl;
             continue;
         }
-        // Additional logic for replacing renderer visuals.
+        // i hate crashes
     }
 }
 
@@ -42,9 +42,8 @@ void ReplaceSaberVisuals(SaberType* saber)
             std::cerr << "Warning: element is null, skipping..." << std::endl;
             continue;
         }
-        // Additional logic for replacing visual elements.
+        // mango mango mango mustarrdd
     }
 }
 
-// Additional methods with validation of pointers.
 

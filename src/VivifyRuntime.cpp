@@ -417,7 +417,8 @@ public:
     auto tracksModInfo = CModInfo{.id = "Tracks"};
     modloader_require_mod(&cjdModInfo, CMatchType::MatchType_IdOnly);
     modloader_require_mod(&tracksModInfo, CMatchType::MatchType_IdOnly);
-    EnsureBehaviour();
+    // EnsureBehaviour() intentionally not called here - Unity scene not ready yet
+    // It will be called lazily from Update() on first frame
     SongCore::API::Capabilities::RegisterCapability(kCapability);
     CustomJSONData::CustomEventCallbacks::AddCustomEventCallback(&Runtime::OnCustomEventStatic);
     SongCore::API::LevelSelect::GetLevelWasSelectedEvent() += [](SongCore::API::LevelSelect::LevelWasSelectedEventArgs const& event) {
@@ -1748,10 +1749,7 @@ MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelControlle
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {
   GameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, cutAngleTolerance, uniformScale);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  auto* info = Runtime::Instance().FindAssignedPrefab(noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal ? "colorNotes" : "saber", noteData);
-  if (info == nullptr && noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal) {
-     info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
-  }
+  auto* info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
   if (info) Runtime::Instance().ReplaceNoteVisuals(self, info);
 }
 MAKE_HOOK_MATCH(BombNoteController_Init, &GlobalNamespace::BombNoteController::Init, void, GlobalNamespace::BombNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData) {

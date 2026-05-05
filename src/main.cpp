@@ -1,7 +1,23 @@
+#include "main.hpp"
+#include "VivifyRuntime.hpp"
+#include "custom-types/shared/register.hpp"
+#include "scotland2/shared/modloader.h"
+
+static modloader::ModInfo modInfo{MOD_ID, VERSION, 0};
+
+Configuration& getConfig() {
+  static Configuration config(modInfo);
+  return config;
+}
+
+MOD_EXTERN_FUNC void setup(CModInfo* info) noexcept {
+  *info = modInfo.to_c();
+  getConfig().Load();
+  Paper::Logger::RegisterFileContextId(logger.tag);
+}
+
 MOD_EXTERN_FUNC void late_load() noexcept {
-  logger.info("Starting late_load...");
   il2cpp_functions::Init();
   custom_types::Register::AutoRegister();
   Vivify::LateLoad();
-  logger.info("late_load completed");
 }

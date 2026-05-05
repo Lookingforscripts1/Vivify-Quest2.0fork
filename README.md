@@ -11,3 +11,5 @@ qpm restore
 qpm s build
 qpm s qmod
 ```
+this is still very buggy, just less buggy than original vivify. expect bugs, expect crashes
+known maps to not work: you, kitchen gun thats all i know tbhh

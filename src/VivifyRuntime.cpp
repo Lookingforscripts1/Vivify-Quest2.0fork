@@ -1,6 +1,9 @@
+// ohio sigma rizzler things
 #include "VivifyRuntime.hpp"
 #include "main.hpp"
 #include "VivifyHandlers.hpp"
+#include <iostream>
+#include <stdexcept>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -47,8 +50,6 @@
 #include "UnityEngine/Rigidbody.hpp"
 #include "UnityEngine/Collider.hpp"
 #include "UnityEngine/Video/VideoPlayer.hpp"
-#include "UnityEngine/Rigidbody.hpp"
-#include "UnityEngine/Collider.hpp"
 #include "GlobalNamespace/SaberModelController.hpp"
 #include "GlobalNamespace/Saber.hpp"
 #include "GlobalNamespace/SaberType.hpp"
@@ -749,15 +750,23 @@ private:
   }
   void ResetRuntime() {
     if (_isResetting) return;
+    if (_currentBeatmapData == nullptr && _mainBundle == nullptr && _assets.empty() && _livePrefabs.empty()) return;
     _isResetting = true;
+
+    // Null state early to stop updates
+    _currentBeatmapData = nullptr;
+    _currentRawBeatmapData = nullptr;
+    _beatmapAD = nullptr;
+    _audioTimeSyncController = nullptr;
+
     RestoreGlobalProperties();
-    std::unordered_set<UnityEngine::GameObject*> destroyed;
+    std::unordered_set<void*> destroyed;
     for (auto& [id, prefab] : _livePrefabs) {
       if (prefab.gameObject == nullptr) {
         continue;
       }
       for (auto const& track : prefab.tracks) {
-        track.UnregisterGameObject(prefab.gameObject.ptr());
+        if (track) track.UnregisterGameObject(prefab.gameObject.ptr());
       }
       if (destroyed.emplace(prefab.gameObject.ptr()).second) {
         if (UnityEngine::Object::op_Implicit_bool(prefab.gameObject.ptr())) {
@@ -782,33 +791,27 @@ private:
     _savedGlobalKeywords.clear();
     _assets.clear();
     _assetPaths.clear();
+    for (auto& vp : _videoPlayers) {
+      if (vp && UnityEngine::Object::op_Implicit_bool(vp)) {
+        vp->Stop();
+      }
+    }
     _videoPlayers.clear();
     for (auto& [name, dt] : _declaredTextures) {
-      if (dt.texture != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(dt.texture)) {
-          dt.texture->Release();
+      if (dt.texture != nullptr && UnityEngine::Object::op_Implicit_bool(dt.texture)) {
           UnityEngine::Object::Destroy(dt.texture);
-        }
       }
     }
     _declaredTextures.clear();
     for (auto& [name, cam] : _secondaryCameras) {
-      if (cam.colorRT != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.colorRT)) {
-          cam.colorRT->Release();
+      if (cam.colorRT != nullptr && UnityEngine::Object::op_Implicit_bool(cam.colorRT)) {
           UnityEngine::Object::Destroy(cam.colorRT);
-        }
       }
-      if (cam.depthRT != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.depthRT)) {
-          cam.depthRT->Release();
+      if (cam.depthRT != nullptr && UnityEngine::Object::op_Implicit_bool(cam.depthRT)) {
           UnityEngine::Object::Destroy(cam.depthRT);
-        }
       }
-      if (cam.camera != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.camera)) {
+      if (cam.camera != nullptr && UnityEngine::Object::op_Implicit_bool(cam.camera)) {
           UnityEngine::Object::Destroy(cam.camera->get_gameObject());
-        }
       }
     }
     _secondaryCameras.clear();
@@ -819,14 +822,10 @@ private:
     _savedRenderSettings.clear();
     _assignedPrefabs.clear();
     _cameraProperties.clear();
-    if (_mainBundle != nullptr) {
+    if (_mainBundle != nullptr && UnityEngine::Object::op_Implicit_bool(_mainBundle)) {
       _mainBundle->Unload(false);
       _mainBundle = nullptr;
     }
-    _currentBeatmapData = nullptr;
-    _currentRawBeatmapData = nullptr;
-    _beatmapAD = nullptr;
-    _audioTimeSyncController = nullptr;
     _unsupportedEventWarnings.clear();
     _isResetting = false;
   }
@@ -1606,7 +1605,10 @@ private:
   void RestoreGlobalProperties() {
     for (auto const& [propertyId, value] : _savedGlobalProperties) {
       if (std::holds_alternative<UnityEngine::Texture*>(value)) {
-        UnityEngine::Shader::SetGlobalTexture(propertyId, std::get<UnityEngine::Texture*>(value));
+        auto* tex = std::get<UnityEngine::Texture*>(value);
+        if (tex == nullptr || UnityEngine::Object::op_Implicit_bool(tex)) {
+          UnityEngine::Shader::SetGlobalTexture(propertyId, tex);
+        }
       } else if (std::holds_alternative<UnityEngine::Color>(value)) {
         UnityEngine::Shader::SetGlobalColor(propertyId, std::get<UnityEngine::Color>(value));
       } else if (std::holds_alternative<float>(value)) {
@@ -1655,8 +1657,7 @@ private:
   public:
   AssignedPrefabInfo* FindAssignedPrefab(std::string_view objectType, GlobalNamespace::NoteData* noteData) {
     if (noteData == nullptr) return nullptr;
-    auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
-    if (customNoteData == nullptr) return nullptr;
+    auto* customNoteData = il2cpp_utils::cast<CustomJSONData::CustomNoteData>(noteData);
     auto& ad = TracksAD::getAD(customNoteData->customData);
     if (ad.tracks.empty()) return nullptr;
     for (auto& info : _assignedPrefabs) {
@@ -1702,7 +1703,6 @@ private:
     auto* spawned = UnityEngine::Object::Instantiate(prefab);
     CleanCustomObject(spawned);
     UnityEngine::Transform* noteTransform = noteController->____noteTransform;
-    if (noteTransform == nullptr) return;
     spawned->get_transform()->SetParent(noteTransform, false);
     auto renderers = noteController->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
     for (int i = 0; i < renderers.size(); i++) {
@@ -1749,7 +1749,10 @@ MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelControlle
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {
   GameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, cutAngleTolerance, uniformScale);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  auto* info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
+  auto* info = Runtime::Instance().FindAssignedPrefab(noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal ? "colorNotes" : "saber", noteData);
+  if (info == nullptr && noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal) {
+     info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
+  }
   if (info) Runtime::Instance().ReplaceNoteVisuals(self, info);
 }
 MAKE_HOOK_MATCH(BombNoteController_Init, &GlobalNamespace::BombNoteController::Init, void, GlobalNamespace::BombNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData) {
@@ -1780,4 +1783,5 @@ void RuntimeBehaviour::OnDestroy() {
 void CameraApplier::OnRenderImage(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
   Runtime::Instance().ApplyBlits(src, dest);
 }
+
 }

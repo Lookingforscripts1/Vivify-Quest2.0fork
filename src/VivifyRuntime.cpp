@@ -1,4 +1,3 @@
-// ohio sigma rizzler things
 #include "VivifyRuntime.hpp"
 #include "main.hpp"
 #include "VivifyHandlers.hpp"

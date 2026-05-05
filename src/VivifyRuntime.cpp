@@ -417,8 +417,6 @@ public:
     auto tracksModInfo = CModInfo{.id = "Tracks"};
     modloader_require_mod(&cjdModInfo, CMatchType::MatchType_IdOnly);
     modloader_require_mod(&tracksModInfo, CMatchType::MatchType_IdOnly);
-    // EnsureBehaviour() intentionally not called here - Unity scene not ready yet
-    // It will be called lazily from Update() on first frame
     SongCore::API::Capabilities::RegisterCapability(kCapability);
     CustomJSONData::CustomEventCallbacks::AddCustomEventCallback(&Runtime::OnCustomEventStatic);
     SongCore::API::LevelSelect::GetLevelWasSelectedEvent() += [](SongCore::API::LevelSelect::LevelWasSelectedEventArgs const& event) {
@@ -426,6 +424,7 @@ public:
     };
   }
   void Update() {
+    EnsureBehaviour();
     if (_audioTimeSyncController != nullptr && !UnityEngine::Object::op_Implicit_bool(_audioTimeSyncController)) {
       ResetRuntime();
       return;
@@ -1703,6 +1702,7 @@ private:
     auto* spawned = UnityEngine::Object::Instantiate(prefab);
     CleanCustomObject(spawned);
     UnityEngine::Transform* noteTransform = noteController->____noteTransform;
+    if (noteTransform == nullptr) return;
     spawned->get_transform()->SetParent(noteTransform, false);
     auto renderers = noteController->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
     for (int i = 0; i < renderers.size(); i++) {

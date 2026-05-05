@@ -25,14 +25,14 @@ MOD_EXTERN_FUNC void late_load() noexcept {
   try {
     logger.info("Starting late_load...");
     
-    // Initialize IL2CPP functions first
+    
     if (!il2cpp_functions::Init()) {
       logger.error("Failed to initialize il2cpp_functions");
       return;
     }
     logger.info("IL2CPP initialized successfully");
     
-    // Register custom types
+    // ohio rixzler 
     try {
       custom_types::Register::AutoRegister();
       logger.info("Custom types registered successfully");
@@ -41,7 +41,7 @@ MOD_EXTERN_FUNC void late_load() noexcept {
       return;
     }
     
-    // Initialize Vivify runtime
+    // try touching vivify 
     try {
       Vivify::LateLoad();
       logger.info("Vivify runtime loaded successfully");

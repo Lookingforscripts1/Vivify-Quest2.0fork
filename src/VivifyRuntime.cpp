@@ -1671,7 +1671,9 @@ private:
   }
   AssignedPrefabInfo* FindAssignedSaberPrefab(int type) {
     for (auto& info : _assignedPrefabs) {
-      if (info.objectType == "saber" && info.saberType.has_value() && info.saberType.value() == type) {
+      if (info.objectType != "saber") continue;
+      // Match if no type specified (applies to both sabers) or type matches
+      if (!info.saberType.has_value() || info.saberType.value() == type) {
         return &info;
       }
     }
@@ -1724,7 +1726,7 @@ private:
   }
   void ReplaceSaberVisuals(GlobalNamespace::SaberModelController* smc, GlobalNamespace::Saber* saber, UnityEngine::Transform* parent) {
     if (smc == nullptr || saber == nullptr || parent == nullptr) return;
-    int type = (int)saber->get_saberType();
+    int type = saber->get_saberType().value__;
     auto* info = FindAssignedSaberPrefab(type);
     if (info == nullptr) return;
     auto* prefab = GetAssetAs<UnityEngine::GameObject>(info->asset);

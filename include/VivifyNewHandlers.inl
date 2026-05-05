@@ -397,10 +397,6 @@ void HandleAssignObjectPrefab(CustomJSONData::CustomEventData*, rapidjson::Value
     if (!asset.has_value()) continue;
     std::string assetStr(*asset);
     auto tracks = ReadTracks(*objVal, v2);
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(assetStr);
-    if (prefab == nullptr && !assetStr.empty()) {
-      continue;
-    }
     AssignedPrefabInfo info;
     info.asset = assetStr;
     info.tracks = std::move(tracks);

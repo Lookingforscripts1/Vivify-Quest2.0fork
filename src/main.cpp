@@ -27,10 +27,10 @@ MOD_EXTERN_FUNC void late_load() noexcept {
     
     
     if (!il2cpp_functions::Init()) {
-      logger.error("Failed to initialize il2cpp_functions");
+      logger.error("Failed");
       return;
     }
-    logger.info("IL2CPP initialized successfully");
+    logger.info("ok");
     
     // ohio rixzler 
     try {

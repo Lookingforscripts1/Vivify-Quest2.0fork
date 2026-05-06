@@ -49,6 +49,7 @@
       "version": "^4.6.4",
       "id": "paper2_scotland2",
       "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.7.0/paper2_scotland2.qmod"
-    }],
+    }
+  ],
   "fileCopies": []
 }

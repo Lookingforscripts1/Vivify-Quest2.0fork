@@ -786,6 +786,7 @@ private:
     }
     LoadMainBundle();
     PreloadInstantiatePrefabs();
+    PreloadAssignedPrefabs();
   }
   void ResetRuntime() {
     _isResetting = true;
@@ -972,6 +973,34 @@ private:
         data.instance->SetActive(false);
       }
       _instantiatePrefabs.emplace(customEventData, std::move(data));
+    }
+  }
+  void PreloadAssignedPrefabs() {
+    if (_currentBeatmapData == nullptr) return;
+    bool const v2 = _currentBeatmapData->v2orEarlier;
+    static constexpr std::string_view objectTypes[] = {
+      "colorNotes", "bombNotes", "burstSliders", "burstSliderElements", "saber"};
+    for (auto* customEventData : _currentBeatmapData->customEventDatas) {
+      if (customEventData == nullptr || customEventData->type != kAssignObjectPrefabEvent) continue;
+      auto* json = GetEventJson(customEventData);
+      if (json == nullptr) continue;
+      for (auto const& objType : objectTypes) {
+        auto* objVal = ReadValuePtr(*json, objType);
+        if (objVal == nullptr || !objVal->IsObject()) continue;
+        auto asset = ReadStringView(*objVal, "asset");
+        if (!asset.has_value()) continue;
+        std::string assetStr(*asset);
+        auto tracks = ReadTracks(*objVal, v2);
+        AssignedPrefabInfo info;
+        info.asset = assetStr;
+        info.tracks = std::move(tracks);
+        info.objectType = std::string(objType);
+        if (objType == "saber") {
+          auto type = ReadInt(*objVal, "type");
+          if (type.has_value()) info.saberType = *type;
+        }
+        _assignedPrefabs.push_back(std::move(info));
+      }
     }
   }
   std::string GetPrefabStorageId(CustomJSONData::CustomEventData* customEventData,
@@ -1667,7 +1696,7 @@ private:
 }
 MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelController::Init, void, GlobalNamespace::SaberModelController* self, UnityEngine::Transform* parent, GlobalNamespace::Saber* saber, UnityEngine::Color trailTintColor) {
   SaberModelController_Init(self, parent, saber, trailTintColor);
-  if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
+  if (Runtime::Instance().IsResetting()) return;
   Runtime::Instance().ReplaceSaberVisuals(self, saber, parent);
 }
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {

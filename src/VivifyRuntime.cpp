@@ -393,6 +393,10 @@ public:
   }
   CustomJSONData::CustomBeatmapData* GetCurrentBeatmapData() const { return _currentBeatmapData; }
   bool IsResetting() const { return _isResetting; }
+  bool HasAssignedPrefabs() const { return !_assignedPrefabs.empty(); }
+  void QueueSaberController(GlobalNamespace::SaberModelController* smc, GlobalNamespace::Saber* saber, UnityEngine::Transform* parent) {
+    _pendingSaberControllers.emplace_back(smc, saber, parent);
+  }
   AssignedPrefabInfo* FindAssignedPrefab(std::string_view objectType, GlobalNamespace::NoteData* noteData) {
     if (noteData == nullptr) return nullptr;
     auto* customNoteData = il2cpp_utils::cast<CustomJSONData::CustomNoteData>(noteData);
@@ -857,6 +861,7 @@ private:
     _renderSettingAnimations.clear();
     _savedRenderSettings.clear();
     _assignedPrefabs.clear();
+    _pendingSaberControllers.clear();
     _videoPlayers.clear();
     _assetPaths.clear();
     _cameraProperties.clear();
@@ -868,6 +873,10 @@ private:
     _beatmapAD = nullptr;
     _audioTimeSyncController = nullptr;
     _unsupportedEventWarnings.clear();
+    if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
+      UnityEngine::Object::Destroy(_cameraApplier);
+    }
+    _cameraApplier = nullptr;
     _isResetting = false;
   }
   void LoadMainBundle() {
@@ -1003,6 +1012,13 @@ private:
         _assignedPrefabs.push_back(std::move(info));
       }
     }
+    // Re-apply to sabers that already spawned before this ran
+    for (auto& [smc, saber, parent] : _pendingSaberControllers) {
+      if (smc != nullptr && UnityEngine::Object::op_Implicit_bool(smc)) {
+        ReplaceSaberVisuals(smc, saber, parent);
+      }
+    }
+    _pendingSaberControllers.clear();
   }
   std::string GetPrefabStorageId(CustomJSONData::CustomEventData* customEventData,
                                  InstantiatePrefabData const& data) const {
@@ -1689,6 +1705,7 @@ private:
   std::vector<ActiveRenderSettingAnimation> _renderSettingAnimations;
   std::vector<SavedRenderSetting> _savedRenderSettings;
   std::vector<AssignedPrefabInfo> _assignedPrefabs;
+  std::vector<std::tuple<GlobalNamespace::SaberModelController*, GlobalNamespace::Saber*, UnityEngine::Transform*>> _pendingSaberControllers;
   CameraApplier* _cameraApplier = nullptr;
   std::vector<UnityEngine::Video::VideoPlayer*> _videoPlayers;
   std::unordered_map<std::string, std::string> _assetPaths;
@@ -1698,7 +1715,11 @@ private:
 MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelController::Init, void, GlobalNamespace::SaberModelController* self, UnityEngine::Transform* parent, GlobalNamespace::Saber* saber, UnityEngine::Color trailTintColor) {
   SaberModelController_Init(self, parent, saber, trailTintColor);
   if (Runtime::Instance().IsResetting()) return;
-  Runtime::Instance().ReplaceSaberVisuals(self, saber, parent);
+  if (Runtime::Instance().HasAssignedPrefabs()) {
+    Runtime::Instance().ReplaceSaberVisuals(self, saber, parent);
+  } else {
+    Runtime::Instance().QueueSaberController(self, saber, parent);
+  }
 }
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {
   GameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, cutAngleTolerance, uniformScale);

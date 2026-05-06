@@ -415,7 +415,9 @@ public:
   bool HasAssignedPrefabs() const { return !_assignedPrefabs.empty(); }
   void PrepareBeatmapEarly(CustomJSONData::CustomBeatmapData* beatmapData) {
     if (_currentBeatmapData == beatmapData) return;
-    PrepareBeatmap(beatmapData, beatmapData);
+    auto* rawData = il2cpp_utils::try_cast<GlobalNamespace::IReadonlyBeatmapData>(beatmapData).value_or(nullptr);
+    if (rawData == nullptr) return;
+    PrepareBeatmap(beatmapData, rawData);
   }
   void LateLoad() {
     auto cjdModInfo = CustomJSONData::modInfo.to_c();

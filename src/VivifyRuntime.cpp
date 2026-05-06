@@ -1,6 +1,8 @@
 #include "VivifyRuntime.hpp"
 #include "main.hpp"
 #include "VivifyHandlers.hpp"
+#include <iostream>
+#include <stdexcept>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -14,7 +16,6 @@
 #include <variant>
 #include <vector>
 #include <filesystem>
-#include <fstream>
 #include "GlobalNamespace/AudioTimeSyncController.hpp"
 #include "GlobalNamespace/BeatmapCallbacksController.hpp"
 #include "GlobalNamespace/BpmController.hpp"
@@ -56,13 +57,24 @@
 #include "GlobalNamespace/BombNoteController.hpp"
 #include "GlobalNamespace/BurstSliderGameNoteController.hpp"
 #include "GlobalNamespace/NoteData.hpp"
-#include "GlobalNamespace/NoteVisualModifierType.hpp"
+#include "GlobalNamespace/NoteCutDirection.hpp"
 #include "GlobalNamespace/MaterialPropertyBlockController.hpp"
 #include "GlobalNamespace/NoteSpawnData.hpp"
+#include "GlobalNamespace/NoteVisualModifierType.hpp"
 #include "beatsaber-hook/shared/utils/hooking.hpp"
+#include "custom-json-data/shared/CJDLogger.h"
 #include "custom-json-data/shared/CustomBeatmapData.h"
 #include "custom-json-data/shared/CustomEventData.h"
 #include "custom-types/shared/macros.hpp"
+#include "bsml/shared/BSML.hpp"
+#include "sombrero/shared/Vector3Utils.hpp"
+#include "sombrero/shared/ColorUtils.hpp"
+#include "custom-types/shared/delegate.hpp"
+#include "web-utils/shared/WebUtils.hpp"
+#include "bsml/shared/BSML/MainThreadScheduler.hpp"
+#include <fstream>
+#include "beatsaber-hook/shared/config/rapidjson-utils.hpp"
+#include "metacore/shared/game.hpp"
 #include "paper2_scotland2/shared/logger.hpp"
 #include "scotland2/shared/modloader.h"
 #include "songcore/shared/Capabilities.hpp"
@@ -73,11 +85,8 @@
 #include "tracks/shared/Animation/TransformData.hpp"
 #include "tracks/shared/AssociatedData.h"
 #include "tracks/shared/Constants.h"
-#include "tracks/shared/StaticHolders.hpp"
-#include "web-utils/shared/WebUtils.hpp"
-#include "bsml/shared/BSML/MainThreadScheduler.hpp"
 #include "metacore/shared/game.hpp"
-#include "beatsaber-hook/shared/config/rapidjson-utils.hpp"
+#include "tracks/shared/StaticHolders.hpp"
 using namespace std::string_view_literals;
 DECLARE_CLASS_CODEGEN(Vivify, RuntimeBehaviour, UnityEngine::MonoBehaviour) {
   DECLARE_DEFAULT_CTOR();
@@ -133,16 +142,16 @@ struct AnimatorPropertyChange {
   AnimatorValue value;
 };
 struct InstantiatePrefabData {
-  std::string asset;
   std::optional<std::string> id;
+  std::string asset;
   Tracks::TransformData transformData;
   std::vector<TrackW> tracks;
-  UnityEngine::GameObject* instance = nullptr;
+  UnityW<UnityEngine::GameObject> instance = nullptr;
 };
 struct LivePrefab {
-  UnityEngine::GameObject* gameObject = nullptr;
+  UnityW<UnityEngine::GameObject> gameObject = nullptr;
   std::vector<TrackW> tracks;
-  std::vector<UnityEngine::Animator*> animators;
+  std::vector<UnityW<UnityEngine::Animator>> animators;
 };
 struct ActiveMaterialAnimation {
   UnityEngine::Material* material = nullptr;
@@ -241,6 +250,14 @@ bool IsSupportedEvent(std::string_view type) {
 }
 std::string NormalizeAssetKey(std::string_view input) {
   std::string key(input);
+  size_t slashPos = key.find_last_of("/\\");
+  if (slashPos != std::string::npos) {
+    key = key.substr(slashPos + 1);
+  }
+  size_t dotPos = key.find_last_of('.');
+  if (dotPos != std::string::npos) {
+    key = key.substr(0, dotPos);
+  }
   std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
   });
@@ -391,107 +408,14 @@ public:
     static Runtime runtime;
     return runtime;
   }
-  CustomJSONData::CustomBeatmapData* GetCurrentBeatmapData() const { return _currentBeatmapData; }
+  CustomJSONData::CustomBeatmapData* GetCurrentBeatmapData() const {
+    return _currentBeatmapData;
+  }
   bool IsResetting() const { return _isResetting; }
   bool HasAssignedPrefabs() const { return !_assignedPrefabs.empty(); }
-  void QueueSaberController(GlobalNamespace::SaberModelController* smc, GlobalNamespace::Saber* saber, UnityEngine::Transform* parent) {
-    _pendingSaberControllers.emplace_back(smc, saber, parent);
-  }
   void PrepareBeatmapEarly(CustomJSONData::CustomBeatmapData* beatmapData) {
-    if (_currentBeatmapData == beatmapData) return; // already prepared
-    PrepareBeatmap(beatmapData);
-  }
-  AssignedPrefabInfo* FindAssignedPrefab(std::string_view objectType, GlobalNamespace::NoteData* noteData) {
-    if (noteData == nullptr) return nullptr;
-    auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
-    if (customNoteData == nullptr) return nullptr;
-    auto& ad = TracksAD::getAD(customNoteData->customData);
-    if (ad.tracks.empty()) return nullptr;
-    for (auto& info : _assignedPrefabs) {
-      if (info.objectType != objectType) continue;
-      for (auto& t : ad.tracks) {
-        for (auto& it : info.tracks) {
-          if (t == it) return &info;
-        }
-      }
-    }
-    return nullptr;
-  }
-  AssignedPrefabInfo* FindAssignedSaberPrefab(int type) {
-    for (auto& info : _assignedPrefabs) {
-      if (info.objectType != "saber") continue;
-      if (!info.saberType.has_value() || info.saberType.value() == type) {
-        return &info;
-      }
-    }
-    return nullptr;
-  }
-  void CleanCustomObject(UnityEngine::GameObject* go) {
-    if (go == nullptr || !UnityEngine::Object::op_Implicit_bool(go)) return;
-    auto rigidbodies = go->GetComponentsInChildren<UnityEngine::Rigidbody*>(true);
-    for (int i = 0; i < rigidbodies.size(); i++) {
-      rigidbodies[i]->set_isKinematic(true);
-      rigidbodies[i]->set_useGravity(false);
-    }
-    auto colliders = go->GetComponentsInChildren<UnityEngine::Collider*>(true);
-    for (int i = 0; i < colliders.size(); i++) {
-      colliders[i]->set_enabled(false);
-    }
-    auto videoArray = go->GetComponentsInChildren<UnityEngine::Video::VideoPlayer*>(true);
-    for (int i = 0; i < videoArray.size(); i++) {
-      if (videoArray[i] != nullptr) {
-        _videoPlayers.emplace_back(videoArray[i]);
-      }
-    }
-  }
-  void ReplaceNoteVisuals(GlobalNamespace::NoteController* noteController, AssignedPrefabInfo* info) {
-    if (noteController == nullptr || info == nullptr) return;
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(info->asset);
-    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
-    UnityEngine::Transform* noteTransform = noteController->____noteTransform;
-    if (noteTransform == nullptr) return;
-    // Collect original renderers BEFORE parenting spawned object
-    // otherwise the spawned renderers get included and disabled
-    auto originalRenderers = noteController->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
-    auto* spawned = UnityEngine::Object::Instantiate(prefab);
-    CleanCustomObject(spawned);
-    spawned->get_transform()->SetParent(noteTransform, false);
-    // Disable original note renderers
-    for (int i = 0; i < originalRenderers.size(); i++) {
-      auto* r = originalRenderers[i];
-      if (r->get_transform()->get_parent().ptr() == noteTransform || r->get_transform().ptr() == noteTransform) {
-        r->set_enabled(false);
-      }
-    }
-    // Apply note color to all MPBs (not just the first) so custom notes get the right color
-    auto newRenderers = spawned->GetComponentsInChildren<UnityEngine::Renderer*>(true);
-    auto convertedRenderers = ArrayW<UnityW<UnityEngine::Renderer>>(newRenderers.size());
-    for (int i = 0; i < newRenderers.size(); i++) {
-      convertedRenderers[i] = newRenderers[i];
-    }
-    auto mpbs = noteController->get_gameObject()->GetComponentsInChildren<GlobalNamespace::MaterialPropertyBlockController*>(true);
-    for (int i = 0; i < mpbs.size(); i++) {
-      auto* mpb = mpbs[i];
-      if (mpb != nullptr && UnityEngine::Object::op_Implicit_bool(mpb)) {
-        mpb->____renderers = convertedRenderers;
-        mpb->ApplyChanges();
-      }
-    }
-  }
-  void ReplaceSaberVisuals(GlobalNamespace::SaberModelController* smc, GlobalNamespace::Saber* saber, UnityEngine::Transform* parent) {
-    if (smc == nullptr || saber == nullptr || parent == nullptr) return;
-    int type = saber->get_saberType().value__;
-    auto* info = FindAssignedSaberPrefab(type);
-    if (info == nullptr) return;
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(info->asset);
-    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
-    auto renderers = smc->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
-    for (int i = 0; i < renderers.size(); i++) {
-      renderers[i]->set_enabled(false);
-    }
-    auto* spawned = UnityEngine::Object::Instantiate(prefab);
-    CleanCustomObject(spawned);
-    spawned->get_transform()->SetParent(parent, false);
+    if (_currentBeatmapData == beatmapData) return;
+    PrepareBeatmap(beatmapData, static_cast<GlobalNamespace::IReadonlyBeatmapData*>(beatmapData));
   }
   void LateLoad() {
     auto cjdModInfo = CustomJSONData::modInfo.to_c();
@@ -516,20 +440,24 @@ public:
       }
       return;
     }
-    UpdateMaterialAnimations();
-    UpdateGlobalAnimations();
-    UpdateAnimatorAnimations();
-    UpdateBlitEffects();
-    UpdateRenderSettingAnimations();
-    auto mainCam = UnityEngine::Camera::get_main();
-    if (mainCam != nullptr && UnityEngine::Object::op_Implicit_bool(mainCam)) {
-      auto mainCamGO = mainCam->get_gameObject();
-      if (_cameraApplier == nullptr || _cameraApplier->get_gameObject() != mainCamGO) {
-        if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
-          UnityEngine::Object::Destroy(_cameraApplier);
+    float songTime = CurrentSongTime();
+    UpdateMaterialAnimations(songTime);
+    UpdateGlobalAnimations(songTime);
+    UpdateAnimatorAnimations(songTime);
+    UpdateBlitEffects(songTime);
+    UpdateRenderSettingAnimations(songTime);
+    UpdateVideoPlayers(songTime);
+    if (_cameraCheckFrame++ % 10 == 0) {
+      auto mainCam = UnityEngine::Camera::get_main();
+      if (mainCam != nullptr && UnityEngine::Object::op_Implicit_bool(mainCam)) {
+        auto mainCamGO = mainCam->get_gameObject();
+        if (_cameraApplier == nullptr || _cameraApplier->get_gameObject() != mainCamGO) {
+          if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
+            UnityEngine::Object::Destroy(_cameraApplier);
+          }
+          _cameraApplier = mainCamGO->AddComponent<CameraApplier*>();
+          _cameraApplier->set_enabled(false);
         }
-        _cameraApplier = mainCamGO->AddComponent<CameraApplier*>();
-        _cameraApplier->set_enabled(false);
       }
     }
     if (_cameraApplier) {
@@ -537,6 +465,25 @@ public:
       if (_cameraApplier->get_enabled() != needsBlit) {
         _cameraApplier->set_enabled(needsBlit);
       }
+    }
+  }
+  void UpdateVideoPlayers(float songTime) {
+    if (_audioTimeSyncController == nullptr) return;
+    float timeScale = _audioTimeSyncController->get_timeScale();
+    for (auto it = _videoPlayers.begin(); it != _videoPlayers.end();) {
+      auto vp = *it;
+      if (vp == nullptr || !UnityEngine::Object::op_Implicit_bool(vp.ptr())) {
+        it = _videoPlayers.erase(it);
+        continue;
+      }
+      if (vp->get_isPrepared()) {
+        float vpTime = vp->get_time();
+        if (std::abs(vpTime - songTime) > 0.2f) {
+          vp->set_time(songTime);
+        }
+        vp->set_playbackSpeed(timeScale);
+      }
+      ++it;
     }
   }
   void ApplyBlits(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
@@ -575,11 +522,11 @@ public:
               if (data.material == nullptr) continue;
               auto temp = UnityEngine::RenderTexture::GetTemporary(desc);
               UnityEngine::Graphics::Blit(sTex, temp, data.material, data.pass);
-              UnityEngine::Graphics::Blit(static_cast<UnityEngine::Texture*>(temp), targetRT);
+              UnityEngine::Graphics::CopyTexture(static_cast<UnityEngine::Texture*>(temp), static_cast<UnityEngine::Texture*>(targetRT));
               UnityEngine::RenderTexture::ReleaseTemporary(temp);
             } else {
-              if (data.material != nullptr) UnityEngine::Graphics::Blit(sTex, targetRT, data.material, data.pass);
-              else UnityEngine::Graphics::Blit(sTex, targetRT);
+            if (data.material != nullptr) UnityEngine::Graphics::Blit(sTex, targetRT, data.material, data.pass);
+            else UnityEngine::Graphics::Blit(sTex, targetRT);
             }
           }
         }
@@ -736,6 +683,7 @@ private:
       return;
     }
     if (!IsSupportedEvent(type)) {
+      WarnUnsupported(type);
       return;
     }
     auto* json = GetEventJson(customEventData);
@@ -776,23 +724,22 @@ private:
     }
     _unsupportedEventWarnings.emplace(key);
   }
-  CustomJSONData::CustomBeatmapData* GetCustomBeatmapData(GlobalNamespace::BeatmapCallbacksController* callbackController) {
-    return il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(callbackController->_beatmapData).value_or(nullptr);
-  }
   bool EnsureBeatmapPrepared(GlobalNamespace::BeatmapCallbacksController* callbackController) {
-    auto* customBeatmapData = GetCustomBeatmapData(callbackController);
+    auto* rawData = callbackController->_beatmapData;
+    if (_currentRawBeatmapData == rawData) {
+      return true;
+    }
+    auto* customBeatmapData = il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(rawData).value_or(nullptr);
     if (customBeatmapData == nullptr) {
       return false;
     }
-    if (_currentBeatmapData == customBeatmapData) {
-      return true;
-    }
-    PrepareBeatmap(customBeatmapData);
+    PrepareBeatmap(customBeatmapData, rawData);
     return _currentBeatmapData == customBeatmapData;
   }
-  void PrepareBeatmap(CustomJSONData::CustomBeatmapData* beatmapData) {
+  void PrepareBeatmap(CustomJSONData::CustomBeatmapData* beatmapData, GlobalNamespace::IReadonlyBeatmapData* rawData) {
     ResetRuntime();
     _currentBeatmapData = beatmapData;
+    _currentRawBeatmapData = rawData;
     _beatmapAD = nullptr;
     _audioTimeSyncController = UnityEngine::Object::FindObjectOfType<GlobalNamespace::AudioTimeSyncController*>();
     if (beatmapData->customData != nullptr) {
@@ -807,26 +754,35 @@ private:
     PreloadAssignedPrefabs();
   }
   void ResetRuntime() {
+    if (_isResetting) return;
+    if (_currentBeatmapData == nullptr && _mainBundle == nullptr && _assets.empty() && _livePrefabs.empty()) return;
     _isResetting = true;
+
+    // Null state early to stop updates
+    _currentBeatmapData = nullptr;
+    _currentRawBeatmapData = nullptr;
+    _beatmapAD = nullptr;
+    _audioTimeSyncController = nullptr;
+
     RestoreGlobalProperties();
-    std::unordered_set<UnityEngine::GameObject*> destroyed;
+    std::unordered_set<void*> destroyed;
     for (auto& [id, prefab] : _livePrefabs) {
       if (prefab.gameObject == nullptr) {
         continue;
       }
       for (auto const& track : prefab.tracks) {
-        track.UnregisterGameObject(prefab.gameObject);
+        if (track) track.UnregisterGameObject(prefab.gameObject.ptr());
       }
-      if (destroyed.emplace(prefab.gameObject).second) {
-        if (UnityEngine::Object::op_Implicit_bool(prefab.gameObject)) {
-          UnityEngine::Object::Destroy(prefab.gameObject);
+      if (destroyed.emplace(prefab.gameObject.ptr()).second) {
+        if (UnityEngine::Object::op_Implicit_bool(prefab.gameObject.ptr())) {
+          UnityEngine::Object::Destroy(prefab.gameObject.ptr());
         }
       }
     }
     for (auto& [eventData, instantiate] : _instantiatePrefabs) {
-      if (instantiate.instance != nullptr && destroyed.emplace(instantiate.instance).second) {
-        if (UnityEngine::Object::op_Implicit_bool(instantiate.instance)) {
-          UnityEngine::Object::Destroy(instantiate.instance);
+      if (instantiate.instance != nullptr && destroyed.emplace(instantiate.instance.ptr()).second) {
+        if (UnityEngine::Object::op_Implicit_bool(instantiate.instance.ptr())) {
+          UnityEngine::Object::Destroy(instantiate.instance.ptr());
         }
       }
       instantiate.instance = nullptr;
@@ -839,32 +795,28 @@ private:
     _savedGlobalProperties.clear();
     _savedGlobalKeywords.clear();
     _assets.clear();
+    _assetPaths.clear();
+    for (auto& vp : _videoPlayers) {
+      if (vp && UnityEngine::Object::op_Implicit_bool(vp)) {
+        vp->Stop();
+      }
+    }
+    _videoPlayers.clear();
     for (auto& [name, dt] : _declaredTextures) {
-      if (dt.texture != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(dt.texture)) {
-          dt.texture->Release();
+      if (dt.texture != nullptr && UnityEngine::Object::op_Implicit_bool(dt.texture)) {
           UnityEngine::Object::Destroy(dt.texture);
-        }
       }
     }
     _declaredTextures.clear();
     for (auto& [name, cam] : _secondaryCameras) {
-      if (cam.colorRT != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.colorRT)) {
-          cam.colorRT->Release();
+      if (cam.colorRT != nullptr && UnityEngine::Object::op_Implicit_bool(cam.colorRT)) {
           UnityEngine::Object::Destroy(cam.colorRT);
-        }
       }
-      if (cam.depthRT != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.depthRT)) {
-          cam.depthRT->Release();
+      if (cam.depthRT != nullptr && UnityEngine::Object::op_Implicit_bool(cam.depthRT)) {
           UnityEngine::Object::Destroy(cam.depthRT);
-        }
       }
-      if (cam.camera != nullptr) {
-        if (UnityEngine::Object::op_Implicit_bool(cam.camera)) {
+      if (cam.camera != nullptr && UnityEngine::Object::op_Implicit_bool(cam.camera)) {
           UnityEngine::Object::Destroy(cam.camera->get_gameObject());
-        }
       }
     }
     _secondaryCameras.clear();
@@ -874,17 +826,11 @@ private:
     _renderSettingAnimations.clear();
     _savedRenderSettings.clear();
     _assignedPrefabs.clear();
-    _pendingSaberControllers.clear();
-    _videoPlayers.clear();
-    _assetPaths.clear();
     _cameraProperties.clear();
-    if (_mainBundle != nullptr) {
-      _mainBundle->Unload(true);
+    if (_mainBundle != nullptr && UnityEngine::Object::op_Implicit_bool(_mainBundle)) {
+      _mainBundle->Unload(false);
       _mainBundle = nullptr;
     }
-    _currentBeatmapData = nullptr;
-    _beatmapAD = nullptr;
-    _audioTimeSyncController = nullptr;
     _unsupportedEventWarnings.clear();
     if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
       UnityEngine::Object::Destroy(_cameraApplier);
@@ -899,10 +845,14 @@ private:
       return;
     }
     std::string bundlePath = JoinPath(_selectedLevelPath, kBundleFile);
+    if (!std::filesystem::exists(bundlePath)) {
+      bundlePath = JoinPath(_selectedLevelPath, "bundleandroid2021.vivify");
+    }
     _mainBundle = UnityEngine::AssetBundle::LoadFromFile(StringW(bundlePath));
-    if (_mainBundle == nullptr) {
+    if (_mainBundle == nullptr || !UnityEngine::Object::op_Implicit_bool(_mainBundle)) {
       if (_selectedMapHasVivifyRequirement) {
       }
+      _mainBundle = nullptr;
       return;
     }
     auto assetNames = _mainBundle->GetAllAssetNames();
@@ -910,19 +860,30 @@ private:
       if (!assetName) {
         continue;
       }
-      std::string key = NormalizeAssetKey(il2cpp_utils::detail::to_string(assetName));
-      auto asset = _mainBundle->LoadAsset(assetName);
-      if (asset != nullptr) {
-        _assets[key] = asset;
-      }
+      std::string pathStr = il2cpp_utils::detail::to_string(assetName);
+      std::string key = NormalizeAssetKey(pathStr);
+      _assetPaths[key] = pathStr;
     }
   }
-  UnityEngine::Object* GetAssetObject(std::string_view assetName) const {
-    auto it = _assets.find(NormalizeAssetKey(assetName));
-    return it == _assets.end() ? nullptr : it->second;
+  UnityEngine::Object* GetAssetObject(std::string_view assetName) {
+    std::string key = NormalizeAssetKey(assetName);
+    auto it = _assets.find(key);
+    if (it != _assets.end() && it->second) {
+      return it->second.ptr();
+    }
+    if (_mainBundle == nullptr) return nullptr;
+    auto pathIt = _assetPaths.find(key);
+    if (pathIt != _assetPaths.end()) {
+      auto asset = _mainBundle->LoadAsset(StringW(pathIt->second));
+      if (asset != nullptr && UnityEngine::Object::op_Implicit_bool(asset.ptr())) {
+        _assets[key] = asset;
+        return asset.ptr();
+      }
+    }
+    return nullptr;
   }
   template <typename T>
-  T* GetAssetAs(std::string_view assetName) const {
+  T* GetAssetAs(std::string_view assetName) {
     auto* asset = GetAssetObject(assetName);
     if (asset == nullptr) {
       return nullptr;
@@ -940,9 +901,6 @@ private:
                                                       Tracks::ffi::WrapBaseValueType type) {
     auto* value = ReadValuePtr(object, key);
     if (value == nullptr) {
-      return std::nullopt;
-    }
-    if (!value->IsArray() && !value->IsString()) {
       return std::nullopt;
     }
     if (_beatmapAD != nullptr) {
@@ -993,13 +951,18 @@ private:
       data.tracks = ReadTracks(*json, v2);
       if (auto* prefab = GetAssetAs<UnityEngine::GameObject>(data.asset); prefab != nullptr) {
         data.instance = UnityEngine::Object::Instantiate(prefab);
-        data.instance->SetActive(false);
+        if (data.instance != nullptr && UnityEngine::Object::op_Implicit_bool(data.instance.ptr())) {
+          data.instance->SetActive(false);
+        } else {
+          data.instance = nullptr;
+        }
       }
       _instantiatePrefabs.emplace(customEventData, std::move(data));
     }
   }
   void PreloadAssignedPrefabs() {
     if (_currentBeatmapData == nullptr) return;
+    if (!_assignedPrefabs.empty()) return; // already loaded
     bool const v2 = _currentBeatmapData->v2orEarlier;
     static constexpr std::string_view objectTypes[] = {
       "colorNotes", "bombNotes", "burstSliders", "burstSliderElements", "saber"};
@@ -1012,11 +975,9 @@ private:
         if (objVal == nullptr || !objVal->IsObject()) continue;
         auto asset = ReadStringView(*objVal, "asset");
         if (!asset.has_value()) continue;
-        std::string assetStr(*asset);
-        auto tracks = ReadTracks(*objVal, v2);
         AssignedPrefabInfo info;
-        info.asset = assetStr;
-        info.tracks = std::move(tracks);
+        info.asset = std::string(*asset);
+        info.tracks = ReadTracks(*objVal, v2);
         info.objectType = std::string(objType);
         if (objType == "saber") {
           auto type = ReadInt(*objVal, "type");
@@ -1025,13 +986,6 @@ private:
         _assignedPrefabs.push_back(std::move(info));
       }
     }
-    // Re-apply to sabers that already spawned before this ran
-    for (auto& [smc, saber, parent] : _pendingSaberControllers) {
-      if (smc != nullptr && UnityEngine::Object::op_Implicit_bool(smc)) {
-        ReplaceSaberVisuals(smc, saber, parent);
-      }
-    }
-    _pendingSaberControllers.clear();
   }
   std::string GetPrefabStorageId(CustomJSONData::CustomEventData* customEventData,
                                  InstantiatePrefabData const& data) const {
@@ -1052,13 +1006,18 @@ private:
         return;
       }
       data.instance = UnityEngine::Object::Instantiate(prefab);
-      data.instance->SetActive(false);
+      if (data.instance != nullptr && UnityEngine::Object::op_Implicit_bool(data.instance.ptr())) {
+        data.instance->SetActive(false);
+      } else {
+        data.instance = nullptr;
+        return;
+      }
     }
     std::string storageId = GetPrefabStorageId(customEventData, data);
     if (_livePrefabs.contains(storageId)) {
       DestroyPrefabById(storageId);
     }
-    auto* instance = data.instance;
+    auto* instance = data.instance.ptr();
     instance->SetActive(true);
     auto transform = instance->get_transform();
     bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
@@ -1076,11 +1035,17 @@ private:
           false);
     }
     auto animatorArray = instance->GetComponentsInChildren<UnityEngine::Animator*>(true);
-    std::vector<UnityEngine::Animator*> animators;
+    std::vector<UnityW<UnityEngine::Animator>> animators;
     animators.reserve(animatorArray.size());
     for (auto animator : animatorArray) {
       if (animator != nullptr) {
         animators.emplace_back(animator);
+      }
+    }
+    auto videoArray = instance->GetComponentsInChildren<UnityEngine::Video::VideoPlayer*>(true);
+    for (auto vp : videoArray) {
+      if (vp != nullptr) {
+        _videoPlayers.emplace_back(vp);
       }
     }
     _livePrefabs[storageId] = LivePrefab{
@@ -1098,9 +1063,9 @@ private:
     _livePrefabs.erase(it);
     if (prefab.gameObject != nullptr) {
       for (auto const& track : prefab.tracks) {
-        track.UnregisterGameObject(prefab.gameObject);
+        track.UnregisterGameObject(prefab.gameObject.ptr());
       }
-      UnityEngine::Object::Destroy(prefab.gameObject);
+      UnityEngine::Object::Destroy(prefab.gameObject.ptr());
     }
     return true;
   }
@@ -1289,7 +1254,7 @@ private:
     return std::holds_alternative<PointDefinitionW>(property.value);
   }
   void ApplyMaterialProperty(UnityEngine::Material* material, MaterialPropertyChange const& property, float progress) {
-    if (material == nullptr) {
+    if (material == nullptr || !UnityEngine::Object::op_Implicit_bool(material)) {
       return;
     }
     switch (property.kind) {
@@ -1443,11 +1408,14 @@ private:
         break;
     }
   }
-  void ApplyAnimatorProperty(std::vector<UnityEngine::Animator*> const& animators,
+  void ApplyAnimatorProperty(std::vector<UnityW<UnityEngine::Animator>> const& animators,
                              AnimatorPropertyChange const& property,
                              float progress) {
-    for (auto* animator : animators) {
-      if (animator == nullptr) {
+    if (animators.empty()) {
+      return;
+    }
+    for (auto animator : animators) {
+      if (animator == nullptr || !UnityEngine::Object::op_Implicit_bool(animator.ptr())) {
         continue;
       }
       switch (property.kind) {
@@ -1605,14 +1573,13 @@ private:
     float raw = std::clamp((songTime - startTime) / duration, 0.0f, 1.0f);
     return Easings::Interpolate(raw, easing);
   }
-  void UpdateMaterialAnimations() {
+  void UpdateMaterialAnimations(float songTime) {
     if (_materialAnimations.empty()) {
       return;
     }
-    float songTime = CurrentSongTime();
     auto write = _materialAnimations.begin();
     for (auto read = _materialAnimations.begin(); read != _materialAnimations.end(); ++read) {
-      if (read->material == nullptr) {
+      if (read->material == nullptr || !UnityEngine::Object::op_Implicit_bool(read->material)) {
         continue;
       }
       float progress = AnimationProgress(read->startTime, read->duration, read->easing, songTime);
@@ -1628,11 +1595,10 @@ private:
     }
     _materialAnimations.erase(write, _materialAnimations.end());
   }
-  void UpdateGlobalAnimations() {
+  void UpdateGlobalAnimations(float songTime) {
     if (_globalAnimations.empty()) {
       return;
     }
-    float songTime = CurrentSongTime();
     auto write = _globalAnimations.begin();
     for (auto read = _globalAnimations.begin(); read != _globalAnimations.end(); ++read) {
       float progress = AnimationProgress(read->startTime, read->duration, read->easing, songTime);
@@ -1648,11 +1614,10 @@ private:
     }
     _globalAnimations.erase(write, _globalAnimations.end());
   }
-  void UpdateAnimatorAnimations() {
+  void UpdateAnimatorAnimations(float songTime) {
     if (_animatorAnimations.empty()) {
       return;
     }
-    float songTime = CurrentSongTime();
     auto write = _animatorAnimations.begin();
     for (auto read = _animatorAnimations.begin(); read != _animatorAnimations.end(); ++read) {
       auto prefabIt = _livePrefabs.find(read->prefabId);
@@ -1676,7 +1641,10 @@ private:
   void RestoreGlobalProperties() {
     for (auto const& [propertyId, value] : _savedGlobalProperties) {
       if (std::holds_alternative<UnityEngine::Texture*>(value)) {
-        UnityEngine::Shader::SetGlobalTexture(propertyId, std::get<UnityEngine::Texture*>(value));
+        auto* tex = std::get<UnityEngine::Texture*>(value);
+        if (tex == nullptr || UnityEngine::Object::op_Implicit_bool(tex)) {
+          UnityEngine::Shader::SetGlobalTexture(propertyId, tex);
+        }
       } else if (std::holds_alternative<UnityEngine::Color>(value)) {
         UnityEngine::Shader::SetGlobalColor(propertyId, std::get<UnityEngine::Color>(value));
       } else if (std::holds_alternative<float>(value)) {
@@ -1695,18 +1663,22 @@ private:
   }
   RuntimeBehaviour* _behaviour = nullptr;
   CustomJSONData::CustomBeatmapData* _currentBeatmapData = nullptr;
+  GlobalNamespace::IReadonlyBeatmapData* _currentRawBeatmapData = nullptr;
   GlobalNamespace::AudioTimeSyncController* _audioTimeSyncController = nullptr;
   TracksAD::BeatmapAssociatedData* _beatmapAD = nullptr;
   TracksAD::BeatmapAssociatedData _fallbackBeatmapAD;
   UnityEngine::AssetBundle* _mainBundle = nullptr;
   std::string _selectedLevelPath;
   bool _selectedMapHasVivifyRequirement = false;
-  std::unordered_map<std::string, UnityEngine::Object*> _assets;
+  bool _isResetting = false;
+  std::unordered_map<std::string, UnityW<UnityEngine::Object>> _assets;
+  std::unordered_map<std::string, std::string> _assetPaths;
   std::unordered_map<CustomJSONData::CustomEventData*, InstantiatePrefabData> _instantiatePrefabs;
   std::unordered_map<std::string, LivePrefab> _livePrefabs;
   std::vector<ActiveMaterialAnimation> _materialAnimations;
   std::vector<ActiveGlobalAnimation> _globalAnimations;
   std::vector<ActiveAnimatorAnimation> _animatorAnimations;
+  std::vector<UnityW<UnityEngine::Video::VideoPlayer>> _videoPlayers;
   std::unordered_map<int, SavedGlobalValue> _savedGlobalProperties;
   std::unordered_map<std::string, bool> _savedGlobalKeywords;
   std::unordered_set<std::string> _unsupportedEventWarnings;
@@ -1718,34 +1690,119 @@ private:
   std::vector<ActiveRenderSettingAnimation> _renderSettingAnimations;
   std::vector<SavedRenderSetting> _savedRenderSettings;
   std::vector<AssignedPrefabInfo> _assignedPrefabs;
-  std::vector<std::tuple<GlobalNamespace::SaberModelController*, GlobalNamespace::Saber*, UnityEngine::Transform*>> _pendingSaberControllers;
+  public:
+  AssignedPrefabInfo* FindAssignedPrefab(std::string_view objectType, GlobalNamespace::NoteData* noteData) {
+    if (noteData == nullptr) return nullptr;
+    auto* customNoteData = il2cpp_utils::cast<CustomJSONData::CustomNoteData>(noteData);
+    auto& ad = TracksAD::getAD(customNoteData->customData);
+    if (ad.tracks.empty()) return nullptr;
+    for (auto& info : _assignedPrefabs) {
+      if (info.objectType != objectType) continue;
+      for (auto& t : ad.tracks) {
+        for (auto& it : info.tracks) {
+          if (t == it) return &info;
+        }
+      }
+    }
+    return nullptr;
+  }
+  AssignedPrefabInfo* FindAssignedSaberPrefab(int type) {
+    for (auto& info : _assignedPrefabs) {
+      if (info.objectType != "saber") continue;
+      // Match if no type specified (applies to both sabers) or type matches
+      if (!info.saberType.has_value() || info.saberType.value() == type) {
+        return &info;
+      }
+    }
+    return nullptr;
+  }
+  void CleanCustomObject(UnityEngine::GameObject* go) {
+    if (go == nullptr || !UnityEngine::Object::op_Implicit_bool(go)) return;
+    auto rigidbodies = go->GetComponentsInChildren<UnityEngine::Rigidbody*>(true);
+    for (int i = 0; i < rigidbodies.size(); i++) {
+      rigidbodies[i]->set_isKinematic(true);
+      rigidbodies[i]->set_useGravity(false);
+    }
+    auto colliders = go->GetComponentsInChildren<UnityEngine::Collider*>(true);
+    for (int i = 0; i < colliders.size(); i++) {
+      colliders[i]->set_enabled(false);
+    }
+    auto videoArray = go->GetComponentsInChildren<UnityEngine::Video::VideoPlayer*>(true);
+    for (int i = 0; i < videoArray.size(); i++) {
+      if (videoArray[i] != nullptr) {
+        _videoPlayers.emplace_back(videoArray[i]);
+      }
+    }
+  }
+  void ReplaceNoteVisuals(GlobalNamespace::NoteController* noteController, AssignedPrefabInfo* info) {
+    if (noteController == nullptr || info == nullptr) return;
+    auto* prefab = GetAssetAs<UnityEngine::GameObject>(info->asset);
+    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
+    auto* spawned = UnityEngine::Object::Instantiate(prefab);
+    CleanCustomObject(spawned);
+    UnityEngine::Transform* noteTransform = noteController->____noteTransform;
+    if (noteTransform == nullptr) return;
+    spawned->get_transform()->SetParent(noteTransform, false);
+    auto renderers = noteController->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+    for (int i = 0; i < renderers.size(); i++) {
+      auto* r = renderers[i];
+      if (r->get_transform()->get_parent().ptr() == noteTransform || r->get_transform().ptr() == noteTransform) {
+        r->set_enabled(false);
+      }
+    }
+    auto* mpb = noteController->get_gameObject()->GetComponentInChildren<GlobalNamespace::MaterialPropertyBlockController*>();
+    if (mpb != nullptr && UnityEngine::Object::op_Implicit_bool(mpb)) {
+      auto newRenderers = spawned->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+      auto convertedRenderers = ArrayW<UnityW<UnityEngine::Renderer>>(newRenderers.size());
+      for (int i = 0; i < newRenderers.size(); i++) {
+        convertedRenderers[i] = newRenderers[i];
+      }
+      mpb->____renderers = convertedRenderers;
+      mpb->ApplyChanges();
+    }
+  }
+  void ReplaceSaberVisuals(GlobalNamespace::SaberModelController* smc, GlobalNamespace::Saber* saber, UnityEngine::Transform* parent) {
+    if (smc == nullptr || saber == nullptr || parent == nullptr) return;
+    int type = saber->get_saberType().value__;
+    auto* info = FindAssignedSaberPrefab(type);
+    if (info == nullptr) return;
+    auto* prefab = GetAssetAs<UnityEngine::GameObject>(info->asset);
+    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
+    auto renderers = smc->get_gameObject()->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+    for (int i = 0; i < renderers.size(); i++) {
+      renderers[i]->set_enabled(false);
+    }
+    auto* spawned = UnityEngine::Object::Instantiate(prefab);
+    CleanCustomObject(spawned);
+    spawned->get_transform()->SetParent(parent, false);
+  }
   CameraApplier* _cameraApplier = nullptr;
-  std::vector<UnityEngine::Video::VideoPlayer*> _videoPlayers;
-  std::unordered_map<std::string, std::string> _assetPaths;
-  bool _isResetting = false;
+  int _cameraCheckFrame = 0;
 };
 }
 MAKE_HOOK_MATCH(AudioTimeSyncController_Start, &GlobalNamespace::AudioTimeSyncController::Start, void, GlobalNamespace::AudioTimeSyncController* self) {
   AudioTimeSyncController_Start(self);
   auto* bcc = UnityEngine::Object::FindObjectOfType<GlobalNamespace::BeatmapCallbacksController*>();
   if (bcc == nullptr) return;
-  auto* customBeatmapData = il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(bcc->_beatmapData).value_or(nullptr);
-  if (customBeatmapData != nullptr) {
-    Runtime::Instance().PrepareBeatmapEarly(customBeatmapData);
-  }
+  auto* cbd = il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(bcc->_beatmapData).value_or(nullptr);
+  if (cbd != nullptr) Runtime::Instance().PrepareBeatmapEarly(cbd);
 }
 MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelController::Init, void, GlobalNamespace::SaberModelController* self, UnityEngine::Transform* parent, GlobalNamespace::Saber* saber, UnityEngine::Color trailTintColor) {
   SaberModelController_Init(self, parent, saber, trailTintColor);
   if (Runtime::Instance().IsResetting()) return;
+  if (!Runtime::Instance().HasAssignedPrefabs()) {
+    auto* bcc = UnityEngine::Object::FindObjectOfType<GlobalNamespace::BeatmapCallbacksController*>();
+    if (bcc != nullptr) {
+      auto* cbd = il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(bcc->_beatmapData).value_or(nullptr);
+      if (cbd != nullptr) Runtime::Instance().PrepareBeatmapEarly(cbd);
+    }
+  }
   Runtime::Instance().ReplaceSaberVisuals(self, saber, parent);
 }
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {
   GameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, cutAngleTolerance, uniformScale);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  auto* info = Runtime::Instance().FindAssignedPrefab(noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal ? "colorNotes" : "saber", noteData);
-  if (info == nullptr && noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::Normal) {
-     info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
-  }
+  auto* info = Runtime::Instance().FindAssignedPrefab("colorNotes", noteData);
   if (info) Runtime::Instance().ReplaceNoteVisuals(self, info);
 }
 MAKE_HOOK_MATCH(BombNoteController_Init, &GlobalNamespace::BombNoteController::Init, void, GlobalNamespace::BombNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData) {
@@ -1762,11 +1819,11 @@ MAKE_HOOK_MATCH(BurstSliderGameNoteController_Init, &GlobalNamespace::BurstSlide
 }
 void LateLoad() {
   Runtime::Instance().LateLoad();
-  INSTALL_HOOK(PaperLogger, AudioTimeSyncController_Start);
-  INSTALL_HOOK(PaperLogger, SaberModelController_Init);
-  INSTALL_HOOK(PaperLogger, GameNoteController_Init);
-  INSTALL_HOOK(PaperLogger, BombNoteController_Init);
-  INSTALL_HOOK(PaperLogger, BurstSliderGameNoteController_Init);
+  INSTALL_HOOK(logger, AudioTimeSyncController_Start);
+  INSTALL_HOOK(logger, SaberModelController_Init);
+  INSTALL_HOOK(logger, GameNoteController_Init);
+  INSTALL_HOOK(logger, BombNoteController_Init);
+  INSTALL_HOOK(logger, BurstSliderGameNoteController_Init);
 }
 void RuntimeBehaviour::Update() {
   Runtime::Instance().Update();
@@ -1777,4 +1834,5 @@ void RuntimeBehaviour::OnDestroy() {
 void CameraApplier::OnRenderImage(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
   Runtime::Instance().ApplyBlits(src, dest);
 }
+
 }

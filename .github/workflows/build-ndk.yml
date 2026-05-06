@@ -1,0 +1,133 @@
+name: NDK build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - 'master'
+      - 'main'
+      - 'dev/*'
+      - 'feat/*'
+      - 'fix/*'
+    paths-ignore:
+      - '**.yml'
+      - '!.github/workflows/build-ndk.yml'
+      - '**.json'
+      - '!qpm.json'
+      - '!qpm.shared.json'
+      - '!mod.template.json'
+      - '**.txt'
+      - '!CMakeLists.txt'
+      - '**.ps1'
+      - '!build.ps1'
+      - '!createqmod.ps1'
+      - '**.md'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - 'master'
+      - 'main'
+      - 'dev/*'
+      - 'feat/*'
+      - 'fix/*'
+
+env:
+  module_id: "Vivify"
+  qmod_name: "Vivify"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        name: Checkout
+        with:
+          submodules: true
+          lfs: true
+
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
+
+      - name: Create ndkpath.txt
+        run: |
+          echo ${{ steps.setup-ndk.outputs.ndk-path }} > ${GITHUB_WORKSPACE}/ndkpath.txt
+          cat ${GITHUB_WORKSPACE}/ndkpath.txt
+
+      - name: Extract version
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: version
+        run: |
+          echo "TAG=${GITHUB_REF#refs/tags/}" >> ${GITHUB_OUTPUT}
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> ${GITHUB_OUTPUT}
+
+      - name: Setup qpm
+        run: |
+          curl -SL "https://github.com/QuestPackageManager/QPM.CLI/releases/download/v1.5.9/qpm-linux-x64.zip" -o /tmp/qpm.zip
+          unzip /tmp/qpm.zip -d /tmp/qpm
+          mv /tmp/qpm/qpm /usr/local/bin/qpm
+          chmod +x /usr/local/bin/qpm
+          qpm restore
+
+      - name: Upload BS headers
+        uses: actions/upload-artifact@v4
+        with:
+          name: bs-cordl-headers
+          path: |
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__GameNoteController_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__BombNoteController_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__NoteController_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__SaberModelController_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__NoteData_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__Saber_def.hpp
+            extern/includes/bs-cordl/include/GlobalNamespace/zzzz__NoteMovement_def.hpp
+          if-no-files-found: warn
+
+      - name: Build & Create Qmod
+        run: |
+          cd ${GITHUB_WORKSPACE}
+          qpm s qmod
+
+      - name: Get Library Name
+        id: libname
+        run: |
+          cd ./build/
+          pattern="lib${module_id}*.so"
+          files=( $pattern )
+          echo "NAME=${files[0]}" >> ${GITHUB_OUTPUT}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.libname.outputs.NAME }}
+          path: ./build/${{ steps.libname.outputs.NAME }}
+          if-no-files-found: error
+
+      - name: Upload qmod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.qmod_name }}.qmod
+          path: ./${{ env.qmod_name }}.qmod
+          if-no-files-found: error
+
+      - name: Upload release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: upload_file_release
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            ./build/${{ steps.libname.outputs.NAME }}
+            ./build/debug_${{ steps.libname.outputs.NAME }}
+            ./${{ env.qmod_name }}.qmod
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

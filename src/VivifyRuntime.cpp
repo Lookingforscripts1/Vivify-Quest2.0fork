@@ -544,15 +544,6 @@ public:
       _behaviour = nullptr;
     }
   }
-private:
-  Runtime() = default;
-  static void OnCustomEventStatic(GlobalNamespace::BeatmapCallbacksController* callbackController,
-                                  CustomJSONData::CustomEventData* customEventData) {
-    Runtime::Instance().HandleCustomEvent(callbackController, customEventData);
-  }
-  TracksAD::BeatmapAssociatedData& GetPointDataSource() {
-    return _beatmapAD != nullptr ? *_beatmapAD : _fallbackBeatmapAD;
-  }
   void EnsureBehaviour() {
     if (_behaviour != nullptr) {
       return;
@@ -565,6 +556,15 @@ private:
       _cameraApplier = mainCam->get_gameObject()->AddComponent<CameraApplier*>();
       _cameraApplier->set_enabled(false);
     }
+  }
+private:
+  Runtime() = default;
+  static void OnCustomEventStatic(GlobalNamespace::BeatmapCallbacksController* callbackController,
+                                  CustomJSONData::CustomEventData* customEventData) {
+    Runtime::Instance().HandleCustomEvent(callbackController, customEventData);
+  }
+  TracksAD::BeatmapAssociatedData& GetPointDataSource() {
+    return _beatmapAD != nullptr ? *_beatmapAD : _fallbackBeatmapAD;
   }
   void HandleLevelSelected(SongCore::API::LevelSelect::LevelWasSelectedEventArgs const& event) {
     ResetRuntime();
@@ -1791,14 +1791,7 @@ MAKE_HOOK_MATCH(AudioTimeSyncController_Start, &GlobalNamespace::AudioTimeSyncCo
 }
 MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelController::Init, void, GlobalNamespace::SaberModelController* self, UnityEngine::Transform* parent, GlobalNamespace::Saber* saber, UnityEngine::Color trailTintColor) {
   SaberModelController_Init(self, parent, saber, trailTintColor);
-  if (Runtime::Instance().IsResetting()) return;
-  if (!Runtime::Instance().HasAssignedPrefabs()) {
-    auto* bcc = UnityEngine::Object::FindObjectOfType<GlobalNamespace::BeatmapCallbacksController*>();
-    if (bcc != nullptr) {
-      auto* cbd = il2cpp_utils::try_cast<CustomJSONData::CustomBeatmapData>(bcc->_beatmapData).value_or(nullptr);
-      if (cbd != nullptr) Runtime::Instance().PrepareBeatmapEarly(cbd);
-    }
-  }
+  if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
   Runtime::Instance().ReplaceSaberVisuals(self, saber, parent);
 }
 MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::Init, void, GlobalNamespace::GameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float cutAngleTolerance, float uniformScale) {
@@ -1821,6 +1814,7 @@ MAKE_HOOK_MATCH(BurstSliderGameNoteController_Init, &GlobalNamespace::BurstSlide
 }
 void LateLoad() {
   Runtime::Instance().LateLoad();
+  Runtime::Instance().EnsureBehaviour();
   INSTALL_HOOK(PaperLogger, AudioTimeSyncController_Start);
   INSTALL_HOOK(PaperLogger, SaberModelController_Init);
   INSTALL_HOOK(PaperLogger, GameNoteController_Init);

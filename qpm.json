@@ -6,7 +6,7 @@
   "info": {
     "name": "Vivify",
     "id": "vivify",
-    "version": "0.4.0",
+    "version": "0.4.1",
     "url": "https://github.com/Lookingforscripts1/Vivify-Quest3.0fork/",
     "additionalData": {
       "overrideSoName": "libvivify.so",

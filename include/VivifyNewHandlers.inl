@@ -1,12 +1,65 @@
-
+bool SameBlitData(BlitMaterialData const& left, BlitMaterialData const& right) {
+  return left.material == right.material &&
+         left.priority == right.priority &&
+         left.source == right.source &&
+         left.targets == right.targets &&
+         left.pass == right.pass;
+}
+void AddOrUpdateBlitEffect(std::vector<ActiveBlitEffect>& effects, ActiveBlitEffect effect) {
+  auto existing = std::find_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& active) {
+    return SameBlitData(active.data, effect.data);
+  });
+  if (existing != effects.end()) {
+    if (effect.data.frame.has_value()) {
+      existing->data.frame = effect.data.frame;
+      existing->expireTime = 0.0f;
+    } else {
+      existing->data.frame.reset();
+      existing->expireTime = std::max(existing->expireTime, effect.expireTime);
+    }
+  } else {
+    effects.emplace_back(std::move(effect));
+  }
+  std::stable_sort(effects.begin(), effects.end(), [](ActiveBlitEffect const& left, ActiveBlitEffect const& right) {
+    return left.data.priority < right.data.priority;
+  });
+  while (effects.size() > kMaxActiveBlitEffects) {
+    effects.erase(effects.begin());
+  }
+}
 void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Value const& json) {
   auto asset = ReadStringView(json, "asset");
+  std::string normalizedAsset = asset.has_value() ? NormalizeAssetKey(*asset) : std::string();
+  if (GetDisableAllBlits()) {
+    if (GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify Blit skipped at beat {}: Disable All Blits enabled asset='{}'",
+                       customEventData->time,
+                       asset.has_value() ? std::string(*asset) : std::string("<none>"));
+    }
+    return;
+  }
+  if (asset.has_value()) {
+    if (GetDisableBeat0FilmgrainBlit() && std::fabs(customEventData->time) < 0.01f &&
+        normalizedAsset.find("filmgrain") != std::string::npos) {
+      if (GetVivifyDebugLogging()) {
+        PaperLogger.info("Vivify Blit skipped at beat {}: beat-0 filmgrain isolation asset='{}'",
+                         customEventData->time, std::string(*asset));
+      }
+      return;
+    }
+  }
   UnityEngine::Material* material = nullptr;
   if (asset.has_value()) {
     material = GetAssetAs<UnityEngine::Material>(*asset);
     if (material == nullptr) {
+      if (GetVivifyDebugLogging()) {
+        PaperLogger.warn("Vivify Blit material load failed at beat {}: asset='{}'",
+                         customEventData->time, std::string(*asset));
+      }
       return;
     }
+    RepairMaterialShader(material, *asset);
+    LogMaterialShader("Blit", *asset, material);
     auto properties = ParseMaterialProperties(json);
     if (!properties.empty()) {
       float dur = DurationBeatsToSeconds(ReadFloat(json, "duration").value_or(0.0f));
@@ -44,22 +97,59 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
   if (targets.empty()) targets.emplace_back("_Main");
   auto orderStr = ReadStringView(json, "order");
   bool pre = orderStr.has_value() && *orderStr == "BeforeMainEffect";
+  if (GetVivifyDebugLogging()) {
+    std::string targetLog;
+    for (auto const& target : targets) {
+      if (!targetLog.empty()) targetLog += ",";
+      targetLog += target;
+    }
+    auto* shader = material != nullptr ? material->get_shader().unsafePtr() : nullptr;
+    PaperLogger.info(
+        "Vivify Blit event: beat={} asset='{}' shader='{}' source='{}' targets='{}' priority={} pass={} order={} durationBeats={} xrOcclusionMesh={}",
+        customEventData->time,
+        asset.has_value() ? std::string(*asset) : std::string("<none>"),
+        ShaderNameForLog(shader),
+        sourceStr,
+        targetLog,
+        priority,
+        pass,
+        pre ? "BeforeMainEffect" : "AfterMainEffect",
+        ReadFloat(json, "duration").value_or(0.0f),
+        BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
+  }
   auto& effects = pre ? _preEffects : _postEffects;
   float duration = DurationBeatsToSeconds(ReadFloat(json, "duration").value_or(0.0f));
   float songTime = CurrentSongTime();
-  BlitMaterialData bd{material, priority, sourceStr, targets, pass, std::nullopt};
+  BlitMaterialData bd{material, priority, sourceStr, targets, pass, std::nullopt, normalizedAsset, customEventData->time};
   if (duration == 0) {
     bd.frame = static_cast<int>(UnityEngine::Time::get_frameCount());
-    effects.push_back(ActiveBlitEffect{bd, 0.0f});
+    AddOrUpdateBlitEffect(effects, ActiveBlitEffect{bd, 0.0f});
   } else if (duration > 0 && songTime <= customEventData->time + duration) {
-    effects.push_back(ActiveBlitEffect{bd, customEventData->time + duration});
+    AddOrUpdateBlitEffect(effects, ActiveBlitEffect{bd, customEventData->time + duration});
   }
 }
 void UpdateBlitEffects() {
+  if (GetDisableAllBlits()) {
+    if ((!_preEffects.empty() || !_postEffects.empty()) && GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify Blit effects cleared: Disable All Blits enabled pre={} post={}",
+                       _preEffects.size(), _postEffects.size());
+    }
+    _preEffects.clear();
+    _postEffects.clear();
+    ReleaseCachedBlitTextures();
+    return;
+  }
   float songTime = CurrentSongTime();
   int frame = static_cast<int>(UnityEngine::Time::get_frameCount());
   auto cleanup = [&](std::vector<ActiveBlitEffect>& effects) {
     effects.erase(std::remove_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& e) {
+      if (GetDisableBeat0FilmgrainBlit() && std::fabs(e.data.eventBeat) < 0.01f &&
+          e.data.asset.find("filmgrain") != std::string::npos) {
+        if (GetVivifyDebugLogging()) {
+          PaperLogger.info("Vivify Blit effect removed: beat-0 filmgrain isolation asset='{}'", e.data.asset);
+        }
+        return true;
+      }
       if (e.data.frame.has_value()) return e.data.frame.value() != frame;
       return e.expireTime > 0.0f && songTime >= e.expireTime;
     }), effects.end());
@@ -71,6 +161,10 @@ void HandleCreateScreenTexture(rapidjson::Value const& json) {
   auto id = ReadStringView(json, "id");
   if (!id.has_value()) return;
   std::string name(*id);
+  if (auto existing = _declaredTextures.find(name); existing != _declaredTextures.end()) {
+    ReleaseDeclaredTextureData(existing->second);
+    _declaredTextures.erase(existing);
+  }
   DeclaredTextureData dt;
   dt.name = name;
   dt.propertyId = UnityEngine::Shader::PropertyToID(StringW(name));
@@ -84,14 +178,36 @@ void HandleCreateScreenTexture(rapidjson::Value const& json) {
     dt.filterMode = Parsing::ParseFilterMode(*fm);
   if (dt.xRatio <= 0.0f) dt.xRatio = 1.0f;
   if (dt.yRatio <= 0.0f) dt.yRatio = 1.0f;
-  int w = dt.width.value_or(1024);
-  int h = dt.height.value_or(512);
+  int w = std::clamp(dt.width.value_or(1024), 1, kMaxRenderTextureSize);
+  int h = std::clamp(dt.height.value_or(512), 1, kMaxRenderTextureSize);
   w = static_cast<int>(w / dt.xRatio);
   h = static_cast<int>(h / dt.yRatio);
-  auto fmt = dt.format.value_or(UnityEngine::RenderTextureFormat::ARGB32);
+  w = std::clamp(w, 1, kMaxRenderTextureSize);
+  h = std::clamp(h, 1, kMaxRenderTextureSize);
+  auto requestedFmt = dt.format.value_or(UnityEngine::RenderTextureFormat::ARGB32);
+  auto fmt = SupportedRenderTextureFormat(requestedFmt, "CreateScreenTexture:" + name);
+  if (GetVivifyDebugLogging()) {
+    PaperLogger.info(
+        "Vivify CreateScreenTexture: id='{}' size={}x{} requestedFormat={} finalFormat={} filter={} supportsRequested={} propertyId={} xrOcclusionMesh={}",
+        name,
+        w,
+        h,
+        requestedFmt.value__,
+        fmt.value__,
+        dt.filterMode.has_value() ? dt.filterMode->value__ : -1,
+        BoolText(UnityEngine::SystemInfo::SupportsRenderTextureFormat(requestedFmt)),
+        dt.propertyId,
+        BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
+  }
   dt.texture = UnityEngine::RenderTexture::New_ctor(w, h, 0, fmt);
   if (dt.filterMode.has_value()) dt.texture->set_filterMode(dt.filterMode.value());
-  dt.texture->Create();
+  if (!IsAlive(dt.texture) || !dt.texture->Create()) {
+    if (GetVivifyDebugLogging()) {
+      PaperLogger.warn("Vivify CreateScreenTexture failed: id='{}' size={}x{} format={}", name, w, h, fmt.value__);
+    }
+    ReleaseDeclaredTextureData(dt);
+    return;
+  }
   UnityEngine::Shader::SetGlobalTexture(dt.propertyId, static_cast<UnityEngine::Texture*>(dt.texture));
   _declaredTextures[name] = std::move(dt);
 }
@@ -99,6 +215,25 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   auto id = ReadStringView(json, "id");
   if (!id.has_value()) return;
   std::string name(*id);
+  if (GetDisableCreateCameraDepth()) {
+    if (auto existing = _secondaryCameras.find(name); existing != _secondaryCameras.end()) {
+      ReleaseSecondaryCameraData(existing->second);
+      _secondaryCameras.erase(existing);
+    }
+    if (GetVivifyDebugLogging()) {
+      auto texture = ReadStringView(json, "texture");
+      auto depthTexture = ReadStringView(json, "depthTexture");
+      PaperLogger.info("Vivify CreateCamera skipped: isolation toggle enabled id='{}' texture='{}' depthTexture='{}'",
+                       name,
+                       texture.has_value() ? std::string(*texture) : std::string("<none>"),
+                       depthTexture.has_value() ? std::string(*depthTexture) : std::string("<none>"));
+    }
+    return;
+  }
+  if (auto existing = _secondaryCameras.find(name); existing != _secondaryCameras.end()) {
+    ReleaseSecondaryCameraData(existing->second);
+    _secondaryCameras.erase(existing);
+  }
   SecondaryCameraData cam;
   cam.name = name;
   if (auto tex = ReadStringView(json, "texture")) {
@@ -106,12 +241,19 @@ void HandleCreateCamera(rapidjson::Value const& json) {
     cam.texturePropertyId = UnityEngine::Shader::PropertyToID(StringW(*tex));
   }
   if (auto dtex = ReadStringView(json, "depthTexture")) {
-    cam.depthTextureName = std::string(*dtex);
-    cam.depthTexturePropertyId = UnityEngine::Shader::PropertyToID(StringW(*dtex));
+    if (!GetDisableCreateCameraDepth()) {
+      cam.depthTextureName = std::string(*dtex);
+      cam.depthTexturePropertyId = UnityEngine::Shader::PropertyToID(StringW(*dtex));
+    } else if (GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify CreateCamera depth texture disabled: camera='{}' depthTexture='{}'", name, std::string(*dtex));
+    }
   }
   auto* propsVal = ReadValuePtr(json, "properties");
   if (propsVal != nullptr && propsVal->IsObject()) {
     ParseCameraPropertyData(*propsVal, cam.properties);
+  }
+  if (GetDisableCreateCameraDepth()) {
+    cam.properties.depthTextureMode.reset();
   }
   auto mainCam = UnityEngine::Camera::get_main();
   auto* go = UnityEngine::GameObject::New_ctor(StringW("VivifyCamera_" + name));
@@ -121,21 +263,55 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   cam.camera = go->AddComponent<UnityEngine::Camera*>();
   if (mainCam != nullptr) cam.camera->CopyFrom(mainCam);
   cam.camera->set_depth(mainCam ? mainCam->get_depth() - 1 : -2);
+  EnsureMultipassKeywordController(go);
   int w = 1024, h = 512;
   if (mainCam != nullptr) { w = mainCam->get_pixelWidth(); h = mainCam->get_pixelHeight(); }
   if (cam.texturePropertyId.has_value()) {
-    cam.colorRT = UnityEngine::RenderTexture::New_ctor(w, h, 0, UnityEngine::RenderTextureFormat::ARGB32);
-    cam.colorRT->Create();
+    auto colorFormat = SupportedRenderTextureFormat(UnityEngine::RenderTextureFormat::ARGB32, "CreateCamera:color:" + name);
+    cam.colorRT = UnityEngine::RenderTexture::New_ctor(w, h, 0, colorFormat);
+    bool colorCreated = IsAlive(cam.colorRT) && cam.colorRT->Create();
+    if (GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify CreateCamera color RT: id='{}' texture='{}' size={}x{} format={} created={}",
+                       name, cam.textureName.value_or("<none>"), w, h, colorFormat.value__, BoolText(colorCreated));
+    }
+    if (!colorCreated) {
+      ReleaseSecondaryCameraData(cam);
+      return;
+    }
     cam.camera->set_targetTexture(cam.colorRT);
     UnityEngine::Shader::SetGlobalTexture(cam.texturePropertyId.value(),
       static_cast<UnityEngine::Texture*>(cam.colorRT));
   }
   if (cam.depthTexturePropertyId.has_value()) {
-    cam.depthRT = UnityEngine::RenderTexture::New_ctor(w, h, 24, UnityEngine::RenderTextureFormat::Depth);
-    cam.depthRT->Create();
-    cam.camera->set_targetTexture(cam.depthRT);
-    UnityEngine::Shader::SetGlobalTexture(cam.depthTexturePropertyId.value(),
-      static_cast<UnityEngine::Texture*>(cam.depthRT));
+    if (UnityEngine::SystemInfo::SupportsRenderTextureFormat(UnityEngine::RenderTextureFormat::Depth)) {
+      cam.depthRT = UnityEngine::RenderTexture::New_ctor(w, h, 24, UnityEngine::RenderTextureFormat::Depth);
+      bool depthCreated = IsAlive(cam.depthRT) && cam.depthRT->Create();
+      if (GetVivifyDebugLogging()) {
+        PaperLogger.info("Vivify CreateCamera depth RT: id='{}' depthTexture='{}' size={}x{} format={} created={}",
+                         name, cam.depthTextureName.value_or("<none>"), w, h,
+                         UnityEngine::RenderTextureFormat::Depth.value__, BoolText(depthCreated));
+      }
+      if (depthCreated) {
+        UnityEngine::Shader::SetGlobalTexture(cam.depthTexturePropertyId.value(),
+          static_cast<UnityEngine::Texture*>(cam.depthRT));
+      } else {
+        ReleaseRenderTexture(cam.depthRT);
+      }
+    } else if (GetVivifyDebugLogging()) {
+      PaperLogger.warn("Vivify CreateCamera depth RT skipped: Depth RenderTextureFormat unsupported id='{}'", name);
+    }
+  }
+  if (GetVivifyDebugLogging()) {
+    PaperLogger.info("Vivify CreateCamera: id='{}' colorTexture='{}' depthTexture='{}' size={}x{} cameraDepth={} depthTextureMode={} clearFlags={} xrOcclusionMesh={}",
+                     name,
+                     cam.textureName.value_or("<none>"),
+                     cam.depthTextureName.value_or("<none>"),
+                     w,
+                     h,
+                     cam.camera->get_depth(),
+                     cam.properties.depthTextureMode.has_value() ? cam.properties.depthTextureMode->value__ : -1,
+                     cam.properties.clearFlags.has_value() ? cam.properties.clearFlags->value__ : -1,
+                     BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
   }
   ApplyCameraProperties(cam.camera, cam.properties);
   _secondaryCameras[name] = std::move(cam);
@@ -171,6 +347,27 @@ void HandleSetCameraProperty(rapidjson::Value const& json) {
   if (propsVal == nullptr || !propsVal->IsObject()) return;
   CameraPropertyData props;
   ParseCameraPropertyData(*propsVal, props);
+  if (GetDisableCreateCameraDepth()) {
+    if (camId != "_Main") {
+      if (GetVivifyDebugLogging()) {
+        PaperLogger.info("Vivify SetCameraProperty skipped: CreateCamera/Depth isolation camera='{}'", camId);
+      }
+      return;
+    }
+    if (props.depthTextureMode.has_value() && GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify SetCameraProperty depthTextureMode disabled: camera='{}' requested={}",
+                       camId, props.depthTextureMode->value__);
+    }
+    props.depthTextureMode.reset();
+  }
+  if (GetVivifyDebugLogging()) {
+    PaperLogger.info("Vivify SetCameraProperty: camera='{}' depthTextureMode={} clearFlags={} hasBackground={} xrOcclusionMesh={}",
+                     camId,
+                     props.depthTextureMode.has_value() ? props.depthTextureMode->value__ : -1,
+                     props.clearFlags.has_value() ? props.clearFlags->value__ : -1,
+                     BoolText(props.backgroundColor.has_value()),
+                     BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
+  }
   _cameraProperties[camId] = props;
   if (camId == "_Main") {
     auto mainCam = UnityEngine::Camera::get_main();
@@ -208,6 +405,16 @@ void HandleSetRenderingSettings(CustomJSONData::CustomEventData* customEventData
   if (!noDuration && !settings.empty()) {
     _renderSettingAnimations.emplace_back(ActiveRenderSettingAnimation{
       std::move(settings), startTime, duration, easing});
+  }
+  if (GetVivifyDebugLogging()) {
+    PaperLogger.info("Vivify SetRenderingSettings: beat={} durationSeconds={} immediate={} animatedSettings={} hasRenderSettings={} hasQualitySettings={} xrOcclusionMesh={}",
+                     customEventData->time,
+                     duration,
+                     BoolText(noDuration),
+                     settings.size(),
+                     BoolText(rsVal != nullptr && rsVal->IsObject()),
+                     BoolText(qsVal != nullptr && qsVal->IsObject()),
+                     BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
   }
 }
 void SaveRenderSetting(std::string const& name, RenderSettingKind kind) {
@@ -304,14 +511,11 @@ void ParseAndApplyRenderSetting(std::string const& key, rapidjson::Value const& 
     } else {
       ApplyRenderSettingValue(key, f);
       if (!immediate) {
-        auto pd = MakePointDefinition(val.GetObject(), key, Tracks::ffi::WrapBaseValueType::Float);
-        if (pd.has_value()) {
-          RenderSettingValue rsv;
-          rsv.name = key;
-          rsv.kind = RenderSettingKind::Float;
-          rsv.value = std::move(*pd);
-          out.push_back(std::move(rsv));
-        }
+        RenderSettingValue rsv;
+        rsv.name = key;
+        rsv.kind = RenderSettingKind::Float;
+        rsv.value = f;
+        out.push_back(std::move(rsv));
       }
     }
   }
@@ -353,25 +557,84 @@ void RestoreRenderSettings() {
 }
 void HandleAssignObjectPrefab(CustomJSONData::CustomEventData*, rapidjson::Value const& json) {
   bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
-  static constexpr std::string_view objectTypes[] = {
-    "colorNotes", "bombNotes", "burstSliders", "burstSliderElements", "saber"};
-  for (auto const& objType : objectTypes) {
-    auto* objVal = ReadValuePtr(json, objType);
-    if (objVal == nullptr || !objVal->IsObject()) continue;
-    auto asset = ReadStringView(*objVal, "asset");
-    if (!asset.has_value()) continue;
-    std::string assetStr(*asset);
-    auto tracks = ReadTracks(*objVal, v2);
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(assetStr);
-    (void)prefab; // loaded lazily at spawn time
-    AssignedPrefabInfo info;
-    info.asset = assetStr;
-    info.tracks = std::move(tracks);
-    info.objectType = std::string(objType);
-    if (objType == "saber") {
-      auto type = ReadInt(*objVal, "type");
-      if (type.has_value()) info.saberType = *type;
+  bool const additive = [&json]() {
+    auto loadMode = ReadStringView(json, "loadMode");
+    return loadMode.has_value() && NormalizeAssetKey(*loadMode) == "additive";
+  }();
+
+  auto applyAsset = [this, additive](rapidjson::Value const& objVal,
+                                    std::string_view objType,
+                                    AssignedPrefabKind kind,
+                                    std::string_view key,
+                                    std::vector<TrackW> tracks,
+                                    std::optional<int> saberType = std::nullopt) {
+    auto asset = ReadAssetValue(objVal, key);
+    if (asset.state == AssetValueState::Missing) return;
+    if (asset.state == AssetValueState::Null) {
+      ClearAssignedPrefabs(objType, kind, saberType);
+      return;
     }
-    _assignedPrefabs.push_back(std::move(info));
+    AddAssignedPrefab(objType, kind, std::move(asset.value), std::move(tracks), additive, saberType);
+  };
+  auto applyTrail = [this, additive](rapidjson::Value const& objVal, int saberType) {
+    auto asset = ReadAssetValue(objVal, "trailAsset");
+    if (asset.state == AssetValueState::Missing) return;
+    if (asset.state == AssetValueState::Null) {
+      ClearAssignedPrefabs("saber", AssignedPrefabKind::Trail, saberType);
+      return;
+    }
+    AddAssignedTrail(std::move(asset.value),
+                     additive,
+                     saberType,
+                     ReadVector3(objVal, "trailTopPos"),
+                     ReadVector3(objVal, "trailBottomPos"),
+                     ReadFloat(objVal, "trailDuration"),
+                     ReadInt(objVal, "trailSamplingFrequency"),
+                     ReadInt(objVal, "trailGranularity"));
+  };
+
+  auto processTrackedObject = [&](std::string_view objType) {
+    auto* objVal = ReadValuePtr(json, objType);
+    if (objVal == nullptr || !objVal->IsObject()) return;
+    if (!additive) ClearAssignedPrefabs(objType);
+    auto tracks = ReadTracks(*objVal, v2);
+    applyAsset(*objVal, objType, AssignedPrefabKind::Object, "asset", tracks);
+    applyAsset(*objVal, objType, AssignedPrefabKind::Debris, "debrisAsset", tracks);
+  };
+
+  if (auto* colorNotes = ReadValuePtr(json, "colorNotes"); colorNotes != nullptr && colorNotes->IsObject()) {
+    if (!additive) ClearAssignedPrefabs("colorNotes");
+    auto tracks = ReadTracks(*colorNotes, v2);
+    applyAsset(*colorNotes, "colorNotes", AssignedPrefabKind::Object, "asset", tracks);
+    applyAsset(*colorNotes, "colorNotes", AssignedPrefabKind::AnyDirectionObject, "anyDirectionAsset", tracks);
+    applyAsset(*colorNotes, "colorNotes", AssignedPrefabKind::Debris, "debrisAsset", tracks);
+  }
+  processTrackedObject("bombNotes");
+  processTrackedObject("burstSliders");
+  processTrackedObject("burstSliderElements");
+
+  bool saberChanged = false;
+  if (auto* saber = ReadValuePtr(json, "saber"); saber != nullptr && saber->IsObject()) {
+    auto type = ReadStringView(*saber, "type");
+    std::vector<int> saberTypes;
+    std::string normalizedType = type.has_value() ? NormalizeAssetKey(*type) : "both";
+    if (normalizedType == "both") {
+      saberTypes = {0, 1};
+    } else if (normalizedType == "left" || normalizedType == "sabera") {
+      saberTypes = {0};
+    } else if (normalizedType == "right" || normalizedType == "saberb") {
+      saberTypes = {1};
+    }
+    if (!saberTypes.empty()) {
+      if (!additive) ClearAssignedPrefabs("saber");
+      for (int saberType : saberTypes) {
+        applyAsset(*saber, "saber", AssignedPrefabKind::Object, "asset", {}, saberType);
+        applyTrail(*saber, saberType);
+      }
+      saberChanged = true;
+    }
+  }
+  if (saberChanged) {
+    ApplySaberVisualsToActive();
   }
 }

@@ -2131,8 +2131,11 @@ private:
                          bool additive,
                          std::optional<int> saberType = std::nullopt) {
     if (asset.empty()) return;
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(asset);
-    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
+    // NOTE: Do NOT validate the asset here. GetValidPrefabInfos() validates at
+    // spawn time. Validating here causes silent drops when the bundle is loaded
+    // but the asset key doesn't match (e.g. short name vs full Unity path), or
+    // if there is any transient issue at event-fire time. Once dropped, the info
+    // is never retried and notes silently stay stock for the entire song.
     AssignedPrefabInfo info;
     info.asset = std::move(asset);
     info.tracks = std::move(tracks);
@@ -2231,18 +2234,24 @@ private:
   }
   UnityEngine::Transform* GetReplacementParent(GlobalNamespace::NoteController* noteController) {
     if (!IsAlive(noteController)) return nullptr;
-    auto transform = noteController->get_transform();
-    auto* rawTransform = transform.unsafePtr();
-    if (!IsAlive(rawTransform)) return nullptr;
-    if (UsesNoteVisualChild(noteController) && rawTransform->get_childCount() > 0) {
-      return rawTransform->GetChild(0).unsafePtr();
-    }
-    return rawTransform;
+    // Use the explicit _noteTransform backing field (offset 0x28), exactly as
+    // the old version did. The previous GetChild(0) approach was fragile: if
+    // NoteMovement or any other object occupies child slot 0 of the root, the
+    // replacement prefab lands in the wrong part of the hierarchy and becomes
+    // invisible or mispositioned.
+    auto* noteTransform = noteController->_noteTransform.unsafePtr();
+    if (IsAlive(noteTransform)) return noteTransform;
+    // Fallback to root transform if _noteTransform is unset (e.g. BombNote).
+    auto rootTransform = noteController->get_transform();
+    return rootTransform.unsafePtr();
   }
   GlobalNamespace::MaterialPropertyBlockController* GetReplacementMaterialPropertyBlockController(
       GlobalNamespace::NoteController* noteController, UnityEngine::Transform* replacementParent) {
     if (!IsAlive(noteController)) return nullptr;
-    if (UsesNoteVisualChild(noteController) && IsAlive(replacementParent)) {
+    // Try the replacement parent's GameObject first (works for both
+    // GameNoteController and BombNoteController since we now always pass the
+    // correct visual transform via GetReplacementParent).
+    if (IsAlive(replacementParent)) {
       auto parentObject = replacementParent->get_gameObject();
       if (IsAlive(parentObject.unsafePtr())) {
         auto* childMpb = parentObject->GetComponent<GlobalNamespace::MaterialPropertyBlockController*>();

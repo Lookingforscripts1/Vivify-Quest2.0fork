@@ -415,6 +415,9 @@ constexpr std::string_view kSetAnimatorPropertyEvent = "SetAnimatorProperty"sv;
 constexpr std::string_view kSetGlobalPropertyEvent = "SetGlobalProperty"sv;
 constexpr std::string_view kAssignObjectPrefabEvent = "AssignObjectPrefab"sv;
 constexpr std::string_view kBlitEvent = "Blit"sv;
+constexpr std::string_view kPostProcessEvent = "PostProcess"sv;
+constexpr std::string_view kPostProcessingEvent = "PostProcessing"sv;
+constexpr std::string_view kScreenEffectEvent = "ScreenEffect"sv;
 constexpr std::string_view kCreateCameraEvent = "CreateCamera"sv;
 constexpr std::string_view kCreateScreenTextureEvent = "CreateScreenTexture"sv;
 constexpr std::string_view kSetCameraPropertyEvent = "SetCameraProperty"sv;
@@ -582,11 +585,15 @@ struct ActiveSaberVisual {
 bool IsVivifyEvent(std::string_view type) {
   return type == kInstantiatePrefabEvent || type == kDestroyObjectEvent || type == kSetMaterialPropertyEvent ||
          type == kSetAnimatorPropertyEvent || type == kSetGlobalPropertyEvent || type == kAssignObjectPrefabEvent ||
-         type == kBlitEvent || type == kCreateCameraEvent || type == kCreateScreenTextureEvent ||
-         type == kSetCameraPropertyEvent || type == kSetRenderingSettingsEvent;
+         type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent ||
+         type == kCreateCameraEvent || type == kCreateScreenTextureEvent || type == kSetCameraPropertyEvent ||
+         type == kSetRenderingSettingsEvent;
 }
 bool IsSupportedEvent(std::string_view type) {
   return IsVivifyEvent(type);
+}
+bool IsPostProcessingEvent(std::string_view type) {
+  return type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent;
 }
 std::string NormalizeAssetKey(std::string_view input) {
   std::string key(input);
@@ -886,22 +893,14 @@ public:
 
     VisualReplacement replacement;
     bool const hideOriginal = ShouldHideOriginal(validInfos);
-    // Capture original renderers BEFORE spawning the replacement prefab, so
-    // the spawned prefab's renderers are not accidentally included in this list.
     auto originalRenderers = noteController->GetComponentsInChildren<UnityEngine::Renderer*>(true);
     for (auto* info : validInfos) {
       InstantiateReplacementPrefab(*info, replacementParent, replacement);
     }
     if (replacement.spawnedObjects.empty() && replacement.disabledRenderers.empty()) return;
 
-    // DO NOT call ApplyReplacementRenderersToMaterialBlock here.
-    // That function replaces the MaterialPropertyBlockController's renderer list
-    // with the custom prefab's renderers, causing Beat Saber's note-color system
-    // to paint the custom note with saber colors (red/blue).  Custom note prefabs
-    // manage their own material colors and should not be overridden by the MPB.
-    // The saber path (ApplySaberVisuals) intentionally DOES update the MPB via
-    // ApplySaberReplacementColor, so sabers still color-sync correctly.
-
+    ApplyReplacementRenderersToMaterialBlock(
+        GetReplacementMaterialPropertyBlockController(noteController, replacementParent), replacement, hideOriginal);
     if (hideOriginal) {
       DisableOriginalRenderers(originalRenderers, replacement);
     }
@@ -940,12 +939,7 @@ public:
 
     VisualReplacement replacement;
     if (ShouldHideOriginal(validModelInfos)) {
-      auto* parentGO = parent->get_gameObject().unsafePtr();
-      if (IsAlive(parentGO)) {
-        DisableOriginalRenderers(parentGO, replacement);
-      } else {
-        DisableOriginalRenderers(smc->get_gameObject(), replacement);
-      }
+      DisableOriginalRenderers(smc->get_gameObject(), replacement);
     }
     for (auto* info : validModelInfos) {
       InstantiateReplacementPrefab(*info, parent, replacement);
@@ -1197,14 +1191,12 @@ private:
     RefreshMultipassRendering(mainCamGO);
     RefreshGameplayOverlayCamera(mainCam.unsafePtr(), mainCamGO,
                                  _currentBeatmapData != nullptr && !_isResetting && !_pauseMenuActive);
-    auto* finalCameraGO = mainCamGO;
-    if (_gameplayOverlayCamera != nullptr && UnityEngine::Object::op_Implicit_bool(_gameplayOverlayCamera)) {
-      auto* overlayGO = _gameplayOverlayCamera->get_gameObject().unsafePtr();
-      if (IsAlive(overlayGO)) {
-        finalCameraGO = overlayGO;
+    if (IsAlive(mainCam)) {
+      if (auto props = _cameraProperties.find("_Main"); props != _cameraProperties.end()) {
+        ApplyCameraProperties(mainCam.unsafePtr(), props->second);
       }
     }
-    RefreshCameraApplier(finalCameraGO, allowCameraApplier);
+    RefreshCameraApplier(mainCamGO, allowCameraApplier);
   }
   void RefreshMultipassRendering(UnityEngine::GameObject* mainCamGO) {
     if (IsAlive(mainCamGO)) {
@@ -1497,8 +1489,8 @@ private:
       HandleSetAnimatorProperty(customEventData, *json);
     } else if (type == kSetGlobalPropertyEvent) {
       HandleSetGlobalProperty(customEventData, *json);
-    } else if (type == kBlitEvent) {
-      HandleBlit(customEventData, *json);
+    } else if (IsPostProcessingEvent(type)) {
+      HandleBlit(customEventData, *json, type);
     } else if (type == kCreateCameraEvent) {
       HandleCreateCamera(*json);
     } else if (type == kCreateScreenTextureEvent) {
@@ -2129,11 +2121,26 @@ private:
     auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
     if (customNoteData == nullptr || customNoteData->customData == nullptr) return false;
     auto& ad = TracksAD::getAD(customNoteData->customData);
-    if (ad.tracks.empty()) return false;
-    for (auto const& noteTrack : ad.tracks) {
-      for (auto const& assignedTrack : info.tracks) {
-        if (noteTrack == assignedTrack) return true;
+    // Helper: check whether any noteTrack matches any assignedTrack.
+    auto matches = [&](auto const& noteTracks) {
+      if (noteTracks.empty()) return false;
+      for (auto const& noteTrack : noteTracks) {
+        for (auto const& assignedTrack : info.tracks) {
+          if (noteTrack == assignedTrack) return true;
+        }
       }
+      return false;
+    };
+    // Primary: use TracksAD-populated tracks (fast path, already resolved).
+    if (matches(ad.tracks)) return true;
+    // Fallback: at song start, early notes spawn before the Tracks library has
+    // processed their customData, so ad.tracks is empty even though the note
+    // has track assignments in the raw JSON. Parse directly from the raw value
+    // so those first notes get their custom prefab like all later ones do.
+    if (customNoteData->customData->value.has_value()) {
+      bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
+      auto parsedTracks = ReadTracks(customNoteData->customData->value.value().get(), v2);
+      if (matches(parsedTracks)) return true;
     }
     return false;
   }
@@ -2144,6 +2151,11 @@ private:
                          bool additive,
                          std::optional<int> saberType = std::nullopt) {
     if (asset.empty()) return;
+    // NOTE: Do NOT pre-validate the asset here with GetAssetAs. That causes a
+    // silent drop whenever the asset key doesn't resolve at event-fire time (e.g.
+    // short name vs full Unity path mismatch, or transient bundle state). The
+    // info is never retried and notes stay stock for the entire song.
+    // GetValidPrefabInfos() re-validates at actual spawn time, which is correct.
     AssignedPrefabInfo info;
     info.asset = std::move(asset);
     info.tracks = std::move(tracks);
@@ -2177,14 +2189,27 @@ private:
     info.trailGranularity = granularity;
     _assignedPrefabs.push_back(std::move(info));
   }
+  bool TracksOverlap(std::vector<TrackW> const& left, std::vector<TrackW> const& right) const {
+    if (left.empty() || right.empty()) return false;
+    for (auto const& leftTrack : left) {
+      for (auto const& rightTrack : right) {
+        if (leftTrack == rightTrack) return true;
+      }
+    }
+    return false;
+  }
   void ClearAssignedPrefabs(std::string_view objectType,
                             std::optional<AssignedPrefabKind> kind = std::nullopt,
-                            std::optional<int> saberType = std::nullopt) {
+                            std::optional<int> saberType = std::nullopt,
+                            std::vector<TrackW> const* tracks = nullptr) {
     _assignedPrefabs.erase(std::remove_if(_assignedPrefabs.begin(), _assignedPrefabs.end(),
-        [objectType, kind, saberType](AssignedPrefabInfo const& info) {
+        [this, objectType, kind, saberType, tracks](AssignedPrefabInfo const& info) {
           if (info.objectType != objectType) return false;
           if (kind.has_value() && info.kind != kind.value()) return false;
           if (saberType.has_value() && (!info.saberType.has_value() || info.saberType.value() != saberType.value())) return false;
+          if (tracks != nullptr && !tracks->empty() && !info.tracks.empty() && !TracksOverlap(info.tracks, *tracks)) {
+            return false;
+          }
           return true;
         }),
         _assignedPrefabs.end());
@@ -2235,16 +2260,32 @@ private:
       }
     }
   }
+  bool UsesNoteVisualChild(GlobalNamespace::NoteController* noteController) const {
+    if (!IsAlive(noteController)) return false;
+    return il2cpp_utils::try_cast<GlobalNamespace::GameNoteController>(noteController).has_value() ||
+           il2cpp_utils::try_cast<GlobalNamespace::BurstSliderGameNoteController>(noteController).has_value();
+  }
   UnityEngine::Transform* GetReplacementParent(GlobalNamespace::NoteController* noteController) {
     if (!IsAlive(noteController)) return nullptr;
-    auto* noteTransform = noteController->_noteTransform.unsafePtr();
+    // Use the raw ____noteTransform backing field (offset 0x28), NOT GetChild(0).
+    // GetChild(0) is wrong: NoteMovement sits at child index 0 of the root
+    // MonoBehaviour transform, so the replacement prefab gets parented inside
+    // NoteMovement's subtree and becomes invisible/mispositioned.
+    // ____noteTransform is the actual visual transform set by GameNoteController::Init.
+    auto* noteTransform = noteController->____noteTransform.unsafePtr();
     if (IsAlive(noteTransform)) return noteTransform;
+    // Fallback to root if ____noteTransform is unset (e.g. BombNoteController
+    // may not populate it; its root IS the visual transform).
     auto rootTransform = noteController->get_transform();
     return rootTransform.unsafePtr();
   }
   GlobalNamespace::MaterialPropertyBlockController* GetReplacementMaterialPropertyBlockController(
       GlobalNamespace::NoteController* noteController, UnityEngine::Transform* replacementParent) {
     if (!IsAlive(noteController)) return nullptr;
+    // replacementParent is now always ____noteTransform (the correct visual
+    // transform), so we can check it unconditionally — no need to gate on
+    // UsesNoteVisualChild. The old gate meant BombNoteController always fell
+    // through to the slower component searches even when the parent was valid.
     if (IsAlive(replacementParent)) {
       auto parentObject = replacementParent->get_gameObject();
       if (IsAlive(parentObject.unsafePtr())) {

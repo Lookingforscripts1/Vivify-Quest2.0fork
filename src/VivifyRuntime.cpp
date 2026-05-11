@@ -46,6 +46,10 @@
 #include "UnityEngine/RenderTextureDescriptor.hpp"
 #include "UnityEngine/RenderTextureFormat.hpp"
 #include "UnityEngine/Rendering/AmbientMode.hpp"
+#include "UnityEngine/Rendering/CommandBuffer.hpp"
+#include "UnityEngine/Rendering/CameraEvent.hpp"
+#include "UnityEngine/Rendering/RenderTargetIdentifier.hpp"
+#include "UnityEngine/Rendering/BuiltinRenderTextureType.hpp"
 #include "UnityEngine/Shader.hpp"
 #include "UnityEngine/StereoTargetEyeMask.hpp"
 #include "UnityEngine/SystemInfo.hpp"
@@ -360,8 +364,8 @@ void FollowedSaberTrail::Update() {
 
 void FollowedSaberTrail::LateUpdate() {
   auto* trailRenderer = ____trailRenderer.unsafePtr();
-  if (!IsManagedAlive(_followed) || ____movementData == nullptr ||
-      !IsManagedAlive(trailRenderer) || !trailRenderer->____meshRenderer) {
+  auto* meshRenderer = IsManagedAlive(trailRenderer) ? trailRenderer->____meshRenderer.unsafePtr() : nullptr;
+  if (!IsManagedAlive(_followed) || ____movementData == nullptr || !IsManagedAlive(meshRenderer)) {
     Cleanup();
     auto gameObject = get_gameObject();
     if (IsManagedAlive(gameObject.unsafePtr())) {
@@ -499,6 +503,11 @@ struct BlitMaterialData {
   std::optional<int> frame;
   std::string asset;
   float eventBeat = 0.0f;
+  // Pre-resolved RenderTargetIdentifiers filled at command-buffer build time.
+  // Avoids repeated unordered_map lookups on every render call.
+  UnityEngine::Rendering::RenderTargetIdentifier resolvedSource;
+  std::vector<UnityEngine::Rendering::RenderTargetIdentifier> resolvedTargetIds;
+  bool targetsResolved = false;
   bool operator<(BlitMaterialData const& o) const { return priority < o.priority; }
 };
 struct ActiveBlitEffect {
@@ -583,23 +592,26 @@ struct ActiveSaberVisual {
   UnityEngine::Transform* parent = nullptr;
 };
 bool IsVivifyEvent(std::string_view type) {
-  return type == kInstantiatePrefabEvent || type == kDestroyObjectEvent || type == kSetMaterialPropertyEvent ||
-         type == kSetAnimatorPropertyEvent || type == kSetGlobalPropertyEvent || type == kAssignObjectPrefabEvent ||
-         type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent ||
-         type == kCreateCameraEvent || type == kCreateScreenTextureEvent || type == kSetCameraPropertyEvent ||
-         type == kSetRenderingSettingsEvent;
+  // unordered_set gives O(1) average vs the previous O(n) chain of == comparisons.
+  static std::unordered_set<std::string_view> const kVivifyEvents = {
+      kInstantiatePrefabEvent, kDestroyObjectEvent, kSetMaterialPropertyEvent,
+      kSetAnimatorPropertyEvent, kSetGlobalPropertyEvent, kAssignObjectPrefabEvent,
+      kBlitEvent, kPostProcessEvent, kPostProcessingEvent, kScreenEffectEvent,
+      kCreateCameraEvent, kCreateScreenTextureEvent, kSetCameraPropertyEvent,
+      kSetRenderingSettingsEvent,
+  };
+  return kVivifyEvents.count(type) > 0;
 }
 bool IsSupportedEvent(std::string_view type) {
   return IsVivifyEvent(type);
 }
 bool IsPostProcessingEvent(std::string_view type) {
-  return type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent;
+  return type == kBlitEvent || type == kPostProcessEvent ||
+         type == kPostProcessingEvent || type == kScreenEffectEvent;
 }
 std::string NormalizeAssetKey(std::string_view input) {
   std::string key(input);
-  std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
+  for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return key;
 }
 std::string JoinPath(std::string_view left, std::string_view right) {
@@ -778,6 +790,17 @@ float VectorDistance(UnityEngine::Vector3 a, UnityEngine::Vector3 b) {
 }
 int ColorPropertyId() {
   static int id = UnityEngine::Shader::PropertyToID(u"_Color");
+  return id;
+}
+// Shader property IDs for the two ping-pong temporary RenderTextures used by
+// the command buffer blit pipeline. Using PropertyToID lets the command buffer
+// reference them by integer rather than string each frame.
+int VivifyMainRTId() {
+  static int id = UnityEngine::Shader::PropertyToID(u"_VivifyMain");
+  return id;
+}
+int VivifyScratchRTId() {
+  static int id = UnityEngine::Shader::PropertyToID(u"_VivifyScratch");
   return id;
 }
 class Runtime {
@@ -1000,99 +1023,205 @@ public:
     DetectSongRestart();
     UpdateSaberReplacementColors();
   }
-  void ApplyBlits(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
-    if (!IsAlive(src) || (dest != nullptr && !IsAlive(dest))) {
-      if (GetVivifyDebugLogging()) {
-        PaperLogger.warn("Vivify blit skipped: invalid src={} dest={}", reinterpret_cast<void*>(src), reinterpret_cast<void*>(dest));
+  // Resolve source/target RenderTargetIdentifiers for a blit effect at command
+  // buffer build time so we don't hit the unordered_map on every render call.
+  static UnityEngine::Rendering::RenderTargetIdentifier const& MainId() {
+    static auto id = UnityEngine::Rendering::RenderTargetIdentifier(VivifyMainRTId());
+    return id;
+  }
+  static UnityEngine::Rendering::RenderTargetIdentifier const& ScratchId() {
+    static auto id = UnityEngine::Rendering::RenderTargetIdentifier(VivifyScratchRTId());
+    return id;
+  }
+  static UnityEngine::Rendering::RenderTargetIdentifier const& CameraTargetId() {
+    static auto id = UnityEngine::Rendering::RenderTargetIdentifier(
+        UnityEngine::Rendering::BuiltinRenderTextureType::CameraTarget);
+    return id;
+  }
+  // Resolve a named source into a RenderTargetIdentifier. Returns nullopt if
+  // the name maps to _Main (handled by the caller via ping-pong) or is unknown.
+  std::optional<UnityEngine::Rendering::RenderTargetIdentifier> ResolveSourceId(std::string const& name) const {
+    if (name == "_Main") return std::nullopt; // handled by caller
+    if (auto it = _declaredTextures.find(name); it != _declaredTextures.end() && IsAlive(it->second.texture)) {
+      return UnityEngine::Rendering::RenderTargetIdentifier(
+          reinterpret_cast<UnityEngine::RenderTexture*>(it->second.texture));
+    }
+    if (auto it = _secondaryCameras.find(name); it != _secondaryCameras.end() && IsAlive(it->second.colorRT)) {
+      return UnityEngine::Rendering::RenderTargetIdentifier(
+          reinterpret_cast<UnityEngine::RenderTexture*>(it->second.colorRT));
+    }
+    return std::nullopt;
+  }
+  void MarkBlitCommandBufferDirty() {
+    _blitCommandBufferDirty = true;
+  }
+  void DestroyBlitCommandBuffer() {
+    if (IsAlive(_blitCommandBufferCamera) && _blitCommandBuffer != nullptr) {
+      _blitCommandBufferCamera->RemoveCommandBuffer(
+          UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+    }
+    if (_blitCommandBuffer != nullptr) {
+      _blitCommandBuffer->Release();
+      _blitCommandBuffer = nullptr;
+    }
+    _blitCommandBufferCamera = nullptr;
+    _blitCommandBufferAttached = false;
+    _blitCommandBufferDirty = true;
+  }
+  // Build (or clear) the CommandBuffer that applies all active blit effects.
+  // Called from Update() after UpdateBlitEffects() so the effect list is fresh.
+  // The buffer is attached to the camera at CameraEvent::AfterEverything,
+  // which means it runs on the render thread once per eye without any
+  // MonoBehaviour overhead. Re-recording only happens when _blitCommandBufferDirty
+  // is set (effects added, expired, or cleared), not every frame.
+  void RebuildBlitCommandBuffer(UnityEngine::Camera* camera) {
+    bool const hasEffects = !_preEffects.empty() || !_postEffects.empty();
+    bool const wantBuffer = IsAlive(camera) && hasEffects &&
+                            !GetDisableAllBlits() && !_isResetting &&
+                            !_pauseMenuActive && _currentBeatmapData != nullptr;
+
+    // Camera changed — detach from old camera and force a rebuild.
+    if (_blitCommandBufferCamera != camera) {
+      if (IsAlive(_blitCommandBufferCamera) && _blitCommandBuffer != nullptr && _blitCommandBufferAttached) {
+        _blitCommandBufferCamera->RemoveCommandBuffer(
+            UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+        _blitCommandBufferAttached = false;
+      }
+      _blitCommandBufferCamera = camera;
+      _blitCommandBufferDirty = true;
+    }
+
+    if (!wantBuffer) {
+      // Detach if attached.
+      if (_blitCommandBufferAttached && IsAlive(_blitCommandBufferCamera) && _blitCommandBuffer != nullptr) {
+        _blitCommandBufferCamera->RemoveCommandBuffer(
+            UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+        _blitCommandBufferAttached = false;
       }
       return;
     }
-    // All three bypass-to-passthrough conditions collapsed into one branch so we
-    // only call ExecuteBlit once in the common no-op case (menu, pause, reset).
-    bool const passthroughOnly = GetDisableAllBlits() || _isResetting || _pauseMenuActive ||
-                                 _currentBeatmapData == nullptr ||
-                                 (_preEffects.empty() && _postEffects.empty());
-    if (passthroughOnly) {
-      if (GetDisableAllBlits() && GetVivifyDebugLogging()) {
-        PaperLogger.info("Vivify blit passthrough: Disable All Blits is enabled");
-      }
-      ExecuteBlit(static_cast<UnityEngine::Texture*>(src), dest, nullptr, -1);
-      return;
+
+    if (!_blitCommandBufferDirty) return; // Nothing changed — reuse the existing buffer.
+
+    // Allocate the CommandBuffer once and reuse it across frames.
+    if (_blitCommandBuffer == nullptr) {
+      _blitCommandBuffer = UnityEngine::Rendering::CommandBuffer::New_ctor();
+      _blitCommandBuffer->set_name(u"VivifyBlits");
     }
-    auto desc = MainBlitDescriptor(src);
-    auto* main = EnsureCachedBlitTexture(_mainBlitTexture, desc);
-    auto* scratch = EnsureCachedBlitTexture(_scratchBlitTexture, desc);
-    if (!IsAlive(main) || !IsAlive(scratch)) {
-      ExecuteBlit(static_cast<UnityEngine::Texture*>(src), dest, nullptr, -1);
-      return;
+
+    // Detach before re-recording so Unity doesn't execute a half-rebuilt buffer.
+    if (_blitCommandBufferAttached) {
+      camera->RemoveCommandBuffer(
+          UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+      _blitCommandBufferAttached = false;
     }
-    if (!ExecuteBlit(static_cast<UnityEngine::Texture*>(src), main, nullptr, -1)) {
-      ExecuteBlit(static_cast<UnityEngine::Texture*>(src), dest, nullptr, -1);
-      return;
-    }
-    auto* mainCurrent = main;
-    auto* mainScratch = scratch;
-    auto renderEffects = [&](std::vector<ActiveBlitEffect> const& effects) {
-      if (effects.empty()) return;
-      for (auto const& effect : effects) {
-        auto const& data = effect.data;
-        auto* material = CanUseBlitMaterial(data.material, data.pass) ? data.material : nullptr;
-        if (data.material != nullptr && material == nullptr) {
-          if (GetVivifyDebugLogging()) {
-            PaperLogger.warn("Vivify blit effect skipped: invalid material pass={} source={} targets={}",
-                             data.pass, data.source, data.targets.size());
+    _blitCommandBuffer->Clear();
+
+    // Allocate ping-pong temporary RTs sized to the camera's current resolution.
+    // Unity pools these internally, so there's no per-frame heap allocation.
+    auto desc = UnityEngine::RenderTextureDescriptor(camera->get_pixelWidth(), camera->get_pixelHeight());
+    desc.set_msaaSamples(1);
+    desc.set_depthBufferBits(0);
+    _blitCommandBuffer->GetTemporaryRT(VivifyMainRTId(), desc);
+    _blitCommandBuffer->GetTemporaryRT(VivifyScratchRTId(), desc);
+
+    // Copy the camera output into main so effects can read from it.
+    _blitCommandBuffer->Blit(CameraTargetId(), MainId());
+
+    // mainIsActive == true  → main holds the latest result, scratch is free
+    // mainIsActive == false → scratch holds the latest result, main is free
+    bool mainIsActive = true;
+
+    auto encodeEffects = [&](std::vector<ActiveBlitEffect>& effects) {
+      for (auto& effect : effects) {
+        auto& data = effect.data;
+
+        // Validate material once per rebuild.
+        if (!CanUseBlitMaterial(data.material, data.pass)) {
+          if (data.material != nullptr && GetVivifyDebugLogging()) {
+            PaperLogger.warn("Vivify CB: invalid material pass={} source={}", data.pass, data.source);
           }
+          data.targetsResolved = false;
           continue;
         }
-        UnityEngine::RenderTexture* blitSrc = nullptr;
-        if (data.source == "_Main") {
-          blitSrc = mainCurrent;
-        } else if (auto it = _declaredTextures.find(data.source); it != _declaredTextures.end()) {
-          blitSrc = it->second.texture;
-        } else if (auto it = _secondaryCameras.find(data.source); it != _secondaryCameras.end()) {
-          blitSrc = it->second.colorRT;
-        }
-        if (!IsAlive(blitSrc)) {
-          if (GetVivifyDebugLogging()) {
-            PaperLogger.warn("Vivify blit effect skipped: source texture '{}' not available", data.source);
-          }
-          continue;
-        }
-        auto sTex = static_cast<UnityEngine::Texture*>(blitSrc);
-        for (auto const& targetName : data.targets) {
-          if (targetName == "_Main") {
-            if (ExecuteBlit(sTex, mainScratch, material, data.pass)) {
-              std::swap(mainCurrent, mainScratch);
-            }
-          } else if (auto it = _declaredTextures.find(targetName); it != _declaredTextures.end()) {
-            auto targetRT = it->second.texture;
-            if (!IsAlive(targetRT)) {
+
+        // Resolve source and target identifiers on first encode or after any
+        // change (MarkBlitCommandBufferDirty resets targetsResolved).
+        if (!data.targetsResolved) {
+          data.resolvedTargetIds.clear();
+          bool sourceIsMain = (data.source == "_Main");
+          if (!sourceIsMain) {
+            if (auto id = ResolveSourceId(data.source); id.has_value()) {
+              data.resolvedSource = *id;
+            } else {
               if (GetVivifyDebugLogging()) {
-                PaperLogger.warn("Vivify blit target '{}' exists but texture is invalid", targetName);
+                PaperLogger.warn("Vivify CB: source '{}' not found, effect skipped", data.source);
               }
               continue;
             }
-            if (blitSrc == targetRT) {
-              if (material == nullptr) continue;
-              auto targetDesc = MainBlitDescriptor(targetRT);
-              auto temp = UnityEngine::RenderTexture::GetTemporary(targetDesc);
-              if (!IsAlive(temp)) continue;
-              if (ExecuteBlit(sTex, temp, material, data.pass)) {
-                ExecuteBlit(static_cast<UnityEngine::Texture*>(temp), targetRT, nullptr, -1);
-              }
-              UnityEngine::RenderTexture::ReleaseTemporary(temp);
+          }
+          for (auto const& tName : data.targets) {
+            if (tName == "_Main") {
+              // Sentinel: -1 means ping-pong main/scratch
+              data.resolvedTargetIds.push_back(UnityEngine::Rendering::RenderTargetIdentifier(-1));
+            } else if (auto it = _declaredTextures.find(tName);
+                       it != _declaredTextures.end() && IsAlive(it->second.texture)) {
+              data.resolvedTargetIds.push_back(UnityEngine::Rendering::RenderTargetIdentifier(
+                  reinterpret_cast<UnityEngine::RenderTexture*>(it->second.texture)));
             } else {
-              ExecuteBlit(sTex, targetRT, material, data.pass);
+              if (GetVivifyDebugLogging()) {
+                PaperLogger.warn("Vivify CB: target '{}' not found, skipped", tName);
+              }
             }
-          } else if (GetVivifyDebugLogging()) {
-            PaperLogger.warn("Vivify blit target '{}' not found", targetName);
+          }
+          data.targetsResolved = true;
+        }
+
+        // Source: either ping-pong current buffer or a pre-resolved external RT.
+        auto const srcId = (data.source == "_Main")
+            ? (mainIsActive ? MainId() : ScratchId())
+            : data.resolvedSource;
+
+        for (int ti = 0; ti < static_cast<int>(data.resolvedTargetIds.size()); ti++) {
+          auto const& rawTarget = data.resolvedTargetIds[ti];
+          // Sentinel value -1 → ping-pong _Main target
+          bool const isPingPong = (rawTarget == UnityEngine::Rendering::RenderTargetIdentifier(-1));
+
+          if (isPingPong) {
+            auto const dstId = mainIsActive ? ScratchId() : MainId();
+            if (data.pass >= 0) {
+              _blitCommandBuffer->Blit(srcId, dstId, data.material, data.pass);
+            } else {
+              _blitCommandBuffer->Blit(srcId, dstId, data.material);
+            }
+            mainIsActive = !mainIsActive;
+          } else {
+            if (data.pass >= 0) {
+              _blitCommandBuffer->Blit(srcId, rawTarget, data.material, data.pass);
+            } else {
+              _blitCommandBuffer->Blit(srcId, rawTarget, data.material);
+            }
           }
         }
       }
     };
-    renderEffects(_preEffects);
-    renderEffects(_postEffects);
-    ExecuteBlit(static_cast<UnityEngine::Texture*>(mainCurrent), dest, nullptr, -1);
+
+    encodeEffects(_preEffects);
+    encodeEffects(_postEffects);
+
+    // Write final result back to the camera target.
+    _blitCommandBuffer->Blit(mainIsActive ? MainId() : ScratchId(), CameraTargetId());
+
+    _blitCommandBuffer->ReleaseTemporaryRT(VivifyMainRTId());
+    _blitCommandBuffer->ReleaseTemporaryRT(VivifyScratchRTId());
+
+    camera->AddCommandBuffer(UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+    _blitCommandBufferAttached = true;
+    _blitCommandBufferDirty = false;
+
+    if (GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify CB rebuilt: pre={} post={}", _preEffects.size(), _postEffects.size());
+    }
   }
   void OnBehaviourDestroyed(RuntimeBehaviour* behaviour) {
     if (_behaviour == behaviour) {
@@ -1112,8 +1241,7 @@ public:
       }
       _preEffects.clear();
       _postEffects.clear();
-      ReleaseCachedBlitTextures();
-      DestroyCameraApplier();
+      MarkBlitCommandBufferDirty();
     } else if (GetDisableBeat0FilmgrainBlit()) {
       UpdateBlitEffects();
     }
@@ -1148,8 +1276,11 @@ public:
     }
     _pauseMenuActive = active;
     if (active) {
-      if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
-        _cameraApplier->set_enabled(false);
+      // Detach the command buffer while paused so blit effects don't run over the pause menu.
+      if (_blitCommandBufferAttached && IsAlive(_blitCommandBufferCamera) && _blitCommandBuffer != nullptr) {
+        _blitCommandBufferCamera->RemoveCommandBuffer(
+            UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+        _blitCommandBufferAttached = false;
       }
       if (_gameplayOverlayCamera != nullptr && UnityEngine::Object::op_Implicit_bool(_gameplayOverlayCamera)) {
         _gameplayOverlayCamera->set_enabled(false);
@@ -1161,6 +1292,7 @@ public:
   void ForceGameObjectRenderersOnTop(UnityEngine::GameObject* gameObject) {
     if (!IsAlive(gameObject) || _currentBeatmapData == nullptr || _isResetting) return;
     auto renderers = gameObject->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+    _overlayRendererSortingOrders.reserve(_overlayRendererSortingOrders.size() + renderers.size());
     for (int i = 0; i < renderers.size(); i++) {
       ForceRendererOnTop(renderers[i]);
     }
@@ -1194,7 +1326,14 @@ private:
         ApplyCameraProperties(mainCam.unsafePtr(), props->second);
       }
     }
-    RefreshCameraApplier(mainCamGO, allowCameraApplier);
+    // Command buffer blits are attached directly to the camera — no MonoBehaviour needed.
+    if (allowCameraApplier && !_pauseMenuActive) {
+      RebuildBlitCommandBuffer(mainCam.unsafePtr());
+    } else if (_blitCommandBufferAttached && IsAlive(_blitCommandBufferCamera)) {
+      _blitCommandBufferCamera->RemoveCommandBuffer(
+          UnityEngine::Rendering::CameraEvent::AfterEverything, _blitCommandBuffer);
+      _blitCommandBufferAttached = false;
+    }
   }
   void RefreshMultipassRendering(UnityEngine::GameObject* mainCamGO) {
     if (IsAlive(mainCamGO)) {
@@ -1278,39 +1417,9 @@ private:
     }
     _gameplayOverlayCamera = nullptr;
   }
-  void RefreshCameraApplier(UnityEngine::GameObject* mainCamGO, bool allowCameraApplier) {
-    if (_pauseMenuActive) {
-      allowCameraApplier = false;
-    }
-    if (!allowCameraApplier) {
-      if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier) &&
-          _cameraApplier->get_enabled()) {
-        _cameraApplier->set_enabled(false);
-      }
-      return;
-    }
-    if (!IsAlive(mainCamGO)) {
-      DestroyCameraApplier();
-      return;
-    }
-    if (_cameraApplier == nullptr || !UnityEngine::Object::op_Implicit_bool(_cameraApplier) ||
-        _cameraApplier->get_gameObject().unsafePtr() != mainCamGO) {
-      DestroyCameraApplier();
-      _cameraApplier = mainCamGO->AddComponent<CameraApplier*>();
-      _cameraApplier->set_enabled(false);
-    }
-    bool const needsBlit = !GetDisableAllBlits() && (!_preEffects.empty() || !_postEffects.empty());
-    if (_cameraApplier->get_enabled() != needsBlit) {
-      _cameraApplier->set_enabled(needsBlit);
-    }
-  }
-  void DestroyCameraApplier() {
-    if (_cameraApplier != nullptr && UnityEngine::Object::op_Implicit_bool(_cameraApplier)) {
-      _cameraApplier->set_enabled(false);
-      UnityEngine::Object::Destroy(_cameraApplier);
-    }
-    _cameraApplier = nullptr;
-  }
+  // CameraApplier is kept declared (for DEFINE_TYPE / cordl) but is never
+  // added to the camera anymore. All blit work is done via RebuildBlitCommandBuffer
+  // which attaches a CommandBuffer directly at CameraEvent::AfterEverything.
   void HandleLevelSelected(SongCore::API::LevelSelect::LevelWasSelectedEventArgs const& event) {
     ResetRuntime();
     _selectedLevelPath.clear();
@@ -1547,7 +1656,7 @@ private:
   }
   void ResetRuntime() {
     _isResetting = true;
-    DestroyCameraApplier();
+    DestroyBlitCommandBuffer();
     DestroyGameplayOverlayCamera();
     RestoreGlobalProperties();
     RestoreAllVisualReplacements();
@@ -1592,7 +1701,6 @@ private:
     _secondaryCameras.clear();
     _preEffects.clear();
     _postEffects.clear();
-    ReleaseCachedBlitTextures();
     RestoreRenderSettings();
     _renderSettingAnimations.clear();
     _savedRenderSettings.clear();
@@ -1827,58 +1935,9 @@ private:
     _overlayRendererSortingOrders.clear();
     _gameplayOverlayLayerMask = 0;
   }
-  UnityEngine::RenderTextureDescriptor MainBlitDescriptor(UnityEngine::RenderTexture* src) const {
-    auto desc = src->get_descriptor();
-    desc.set_msaaSamples(1);
-    desc.set_depthBufferBits(0);
-    if (desc.get_width() < 1) desc.set_width(1);
-    if (desc.get_height() < 1) desc.set_height(1);
-    return desc;
-  }
-  bool SameBlitDescriptor(UnityEngine::RenderTextureDescriptor left,
-                          UnityEngine::RenderTextureDescriptor right) const {
-    return left.get_width() == right.get_width() &&
-           left.get_height() == right.get_height() &&
-           left.get_volumeDepth() == right.get_volumeDepth() &&
-           left.get_msaaSamples() == right.get_msaaSamples() &&
-           left.get_graphicsFormat().value__ == right.get_graphicsFormat().value__ &&
-           left.get_depthStencilFormat().value__ == right.get_depthStencilFormat().value__ &&
-           left.get_dimension().value__ == right.get_dimension().value__;
-  }
-  void ReleaseRenderTexture(UnityEngine::RenderTexture*& texture) {
-    if (IsAlive(texture)) {
-      texture->Release();
-      UnityEngine::Object::Destroy(texture);
-    }
-    texture = nullptr;
-  }
-  UnityEngine::RenderTexture* EnsureCachedBlitTexture(UnityEngine::RenderTexture*& texture,
-                                                      UnityEngine::RenderTextureDescriptor descriptor) {
-    if (IsAlive(texture)) {
-      auto existing = texture->get_descriptor();
-      if (SameBlitDescriptor(existing, descriptor) && texture->IsCreated()) {
-        return texture;
-      }
-      ReleaseRenderTexture(texture);
-    }
-    texture = UnityEngine::RenderTexture::New_ctor(descriptor);
-    if (!IsAlive(texture)) {
-      texture = nullptr;
-      return nullptr;
-    }
-    if (!texture->Create()) {
-      ReleaseRenderTexture(texture);
-      return nullptr;
-    }
-    return texture;
-  }
-  void ReleaseCachedBlitTextures() {
-    ReleaseRenderTexture(_mainBlitTexture);
-    ReleaseRenderTexture(_scratchBlitTexture);
-  }
   bool CanUseBlitMaterial(UnityEngine::Material* material, int pass) const {
     if (!IsAlive(material)) {
-      if (GetVivifyDebugLogging()) PaperLogger.warn("Vivify blit material invalid: null material");
+      if (GetVivifyDebugLogging()) PaperLogger.warn("Vivify CB material invalid: null");
       return false;
     }
     auto shader = material->get_shader();
@@ -1886,50 +1945,20 @@ private:
     auto shaderName = ShaderNameForLog(rawShader);
     if (!IsAlive(rawShader) || !rawShader->get_isSupported() || IsInternalErrorShaderName(shaderName)) {
       if (GetVivifyDebugLogging()) {
-        PaperLogger.warn("Vivify blit material invalid: material='{}' shader='{}' supported={} internalError={} pass={}",
-                         ToStdString(material->get_name()),
-                         shaderName,
+        PaperLogger.warn("Vivify CB material invalid: material='{}' shader='{}' supported={} internalError={} pass={}",
+                         ToStdString(material->get_name()), shaderName,
                          BoolText(IsAlive(rawShader) && rawShader->get_isSupported()),
-                         BoolText(IsInternalErrorShaderName(shaderName)),
-                         pass);
+                         BoolText(IsInternalErrorShaderName(shaderName)), pass);
       }
       return false;
     }
     int const passCount = material->get_passCount();
     if (passCount <= 0 || (pass >= 0 && pass >= passCount)) {
       if (GetVivifyDebugLogging()) {
-        PaperLogger.warn("Vivify blit material invalid pass: material='{}' pass={} passCount={}",
+        PaperLogger.warn("Vivify CB material invalid pass: material='{}' pass={} passCount={}",
                          ToStdString(material->get_name()), pass, passCount);
       }
       return false;
-    }
-    return true;
-  }
-  bool ExecuteBlit(UnityEngine::Texture* src,
-                   UnityEngine::RenderTexture* dest,
-                   UnityEngine::Material* material,
-                   int pass) const {
-    if (!IsAlive(src)) return false;
-    if (dest != nullptr && !IsAlive(dest)) return false;
-    auto currentCamera = UnityEngine::Camera::get_current();
-    SetMultipassShaderStateForCamera(currentCamera.unsafePtr());
-    if (material != nullptr) {
-      if (!CanUseBlitMaterial(material, pass)) return false;
-      if (GetVivifyDebugLogging()) {
-        PaperLogger.info("Vivify ExecuteBlit: src={} dest={} material='{}' shader='{}' pass={}",
-                         reinterpret_cast<void*>(src),
-                         reinterpret_cast<void*>(dest),
-                         ToStdString(material->get_name()),
-                         ShaderNameForLog(material->get_shader().unsafePtr()),
-                         pass);
-      }
-      UnityEngine::Graphics::Blit(src, dest, material, pass);
-    } else {
-      if (GetVivifyDebugLogging()) {
-        PaperLogger.info("Vivify ExecuteBlit passthrough: src={} dest={}",
-                         reinterpret_cast<void*>(src), reinterpret_cast<void*>(dest));
-      }
-      UnityEngine::Graphics::Blit(src, dest);
     }
     return true;
   }
@@ -2121,22 +2150,16 @@ private:
     auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
     if (customNoteData == nullptr || customNoteData->customData == nullptr) return false;
     auto& ad = TracksAD::getAD(customNoteData->customData);
-    // Helper: check whether any noteTrack matches any assignedTrack.
+    // Build a hash set of the assigned tracks once so matching is O(n) not O(n*m).
+    std::unordered_set<TrackW> assignedSet(info.tracks.begin(), info.tracks.end());
     auto matches = [&](auto const& noteTracks) {
-      if (noteTracks.empty()) return false;
       for (auto const& noteTrack : noteTracks) {
-        for (auto const& assignedTrack : info.tracks) {
-          if (noteTrack == assignedTrack) return true;
-        }
+        if (assignedSet.count(noteTrack)) return true;
       }
       return false;
     };
-    // Primary: use TracksAD-populated tracks (fast path, already resolved).
     if (matches(ad.tracks)) return true;
-    // Fallback: at song start, early notes spawn before the Tracks library has
-    // processed their customData, so ad.tracks is empty even though the note
-    // has track assignments in the raw JSON. Parse directly from the raw value
-    // so those first notes get their custom prefab like all later ones do.
+    // Fallback: early notes at song start may not have ad.tracks populated yet.
     if (customNoteData->customData->value.has_value()) {
       bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
       auto parsedTracks = ReadTracks(customNoteData->customData->value.value().get(), v2);
@@ -3294,12 +3317,15 @@ private:
   std::unordered_map<GlobalNamespace::NoteController*, VisualReplacement> _noteReplacements;
   std::unordered_map<GlobalNamespace::SaberModelController*, VisualReplacement> _saberReplacements;
   std::unordered_map<GlobalNamespace::NoteDebris*, VisualReplacement> _debrisReplacements;
-  CameraApplier* _cameraApplier = nullptr;
+  CameraApplier* _cameraApplier = nullptr; // kept for DEFINE_TYPE, never added to camera
   UnityEngine::Camera* _gameplayOverlayCamera = nullptr;
   int _gameplayOverlayLayerMask = 0;
   MultipassKeywordController* _multipassController = nullptr;
-  UnityEngine::RenderTexture* _mainBlitTexture = nullptr;
-  UnityEngine::RenderTexture* _scratchBlitTexture = nullptr;
+  // Command buffer blit pipeline — replaces the old OnRenderImage / CameraApplier approach.
+  UnityEngine::Rendering::CommandBuffer* _blitCommandBuffer = nullptr;
+  UnityEngine::Camera* _blitCommandBufferCamera = nullptr;
+  bool _blitCommandBufferAttached = false;
+  bool _blitCommandBufferDirty = true;
   std::vector<UnityEngine::Video::VideoPlayer*> _videoPlayers;
   std::unordered_map<std::string, std::string> _assetPaths;
   std::unordered_set<CustomJSONData::CustomEventData*> _catchUpAppliedCustomEvents;
@@ -3475,6 +3501,8 @@ void RuntimeBehaviour::OnDestroy() {
   Runtime::Instance().OnBehaviourDestroyed(this);
 }
 void CameraApplier::OnRenderImage(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
-  Runtime::Instance().ApplyBlits(src, dest);
+  if (IsAlive(src) && IsAlive(dest)) {
+    UnityEngine::Graphics::Blit(static_cast<UnityEngine::Texture*>(src), dest);
+  }
 }
 }

@@ -52,7 +52,6 @@ void AddOrUpdateBlitEffect(std::vector<ActiveBlitEffect>& effects, ActiveBlitEff
   auto existing = std::find_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& active) {
     return SameBlitData(active.data, effect.data);
   });
-  // Always mark dirty — either a new effect is being added or an existing one updated.
   if (existing != effects.end()) {
     if (effect.data.frame.has_value()) {
       existing->data.frame = effect.data.frame;
@@ -205,8 +204,7 @@ void UpdateBlitEffects() {
                        _preEffects.size(), _postEffects.size());
     }
     _preEffects.clear();
-    _postEffects.clear();
-    // CameraApplier enabled state is refreshed each Update() via RefreshCameraApplier.
+    _postEffects.clear(); 
     return;
   }
   float songTime = CurrentSongTime();

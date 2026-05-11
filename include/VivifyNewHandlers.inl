@@ -38,7 +38,6 @@ void RemoveMatchingBlitEffects(std::vector<ActiveBlitEffect>& effects,
                                bool filterTargets,
                                bool filterPriority,
                                bool filterPass) {
-  size_t const before = effects.size();
   effects.erase(std::remove_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& active) {
     if (filterAsset && active.data.asset != filter.asset) return false;
     if (filterSource && active.data.source != filter.source) return false;
@@ -122,7 +121,7 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
         if (!animated.empty()) {
           _materialAnimations.emplace_back(ActiveMaterialAnimation{
             .material = material, .properties = std::move(animated),
-            .startTime = st, .duration = dur, .endTime = st + dur, .easing = eas});
+            .startTime = st, .duration = dur, .easing = eas});
         }
       }
     }
@@ -204,13 +203,13 @@ void UpdateBlitEffects() {
                        _preEffects.size(), _postEffects.size());
     }
     _preEffects.clear();
-    _postEffects.clear(); 
+    _postEffects.clear();
+    ReleaseCachedBlitTextures();
     return;
   }
   float songTime = CurrentSongTime();
   int frame = static_cast<int>(UnityEngine::Time::get_frameCount());
   auto cleanup = [&](std::vector<ActiveBlitEffect>& effects) {
-    size_t const before = effects.size();
     effects.erase(std::remove_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& e) {
       if (GetDisableBeat0FilmgrainBlit() && std::fabs(e.data.eventBeat) < 0.01f &&
           e.data.asset.find("filmgrain") != std::string::npos) {
@@ -538,7 +537,7 @@ void HandleSetRenderingSettings(CustomJSONData::CustomEventData* customEventData
   }
   if (!noDuration && !settings.empty()) {
     _renderSettingAnimations.emplace_back(ActiveRenderSettingAnimation{
-      std::move(settings), startTime, duration, startTime + duration, easing});
+      std::move(settings), startTime, duration, easing});
   }
   if (GetVivifyDebugLogging()) {
     PaperLogger.info("Vivify SetRenderingSettings: beat={} durationSeconds={} immediate={} animatedSettings={} hasRenderSettings={} hasQualitySettings={} xrOcclusionMesh={}",
@@ -660,16 +659,17 @@ void ParseAndApplyQualitySetting(std::string const& key, rapidjson::Value const&
 }
 void UpdateRenderSettingAnimations() {
   if (_renderSettingAnimations.empty()) return;
-  float const songTime = CurrentSongTime();
+  float songTime = CurrentSongTime();
   auto write = _renderSettingAnimations.begin();
   for (auto read = _renderSettingAnimations.begin(); read != _renderSettingAnimations.end(); ++read) {
-    float const progress = AnimationProgress(read->startTime, read->duration, read->easing, songTime);
+    float progress = AnimationProgress(read->startTime, read->duration, read->easing, songTime);
     for (auto const& s : read->settings) {
       if (s.kind == RenderSettingKind::Float && std::holds_alternative<PointDefinitionW>(s.value)) {
-        ApplyRenderSettingValue(s.name, std::get<PointDefinitionW>(s.value).InterpolateLinear(progress));
+        float v = std::get<PointDefinitionW>(s.value).InterpolateLinear(progress);
+        ApplyRenderSettingValue(s.name, v);
       }
     }
-    if (songTime < read->endTime) {
+    if (songTime < read->startTime + read->duration) {
       if (write != read) *write = std::move(*read);
       ++write;
     }

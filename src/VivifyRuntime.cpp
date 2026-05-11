@@ -1100,6 +1100,7 @@ public:
       auto existing = texture->get_descriptor();
       if (existing.get_width() == desc.get_width() &&
           existing.get_height() == desc.get_height() &&
+          existing.get_graphicsFormat().value__ == desc.get_graphicsFormat().value__ &&
           texture->IsCreated()) {
         return texture;
       }
@@ -1479,10 +1480,9 @@ private:
     if (!IsVivifyEvent(type)) {
       return;
     }
-    if (!IsSupportedEvent(type)) {
-      return;
-    }
-    if (type == kAssignObjectPrefabEvent && _catchUpAppliedCustomEvents.erase(customEventData) > 0) {
+    // Skip events that were already applied during catch-up (ApplyMissedVivifyEvents).
+    // This covers all types — InstantiatePrefab, CreateCamera, AssignObjectPrefab, etc.
+    if (_catchUpAppliedCustomEvents.erase(customEventData) > 0) {
       return;
     }
     auto* json = GetEventJson(customEventData);
@@ -1559,9 +1559,6 @@ private:
   void ApplyMissedVivifyEvents() {
     if (_currentBeatmapData == nullptr) return;
     float const songTime = CurrentSongTime();
-    // Use a generous window — the audio sync controller may not be at beat 0
-    // exactly when we call this. Any event at a beat that maps to <= songTime+0.1s
-    // is considered "already past" and must be applied now.
     float const catchUpTime = songTime + 0.10f;
     _catchUpAppliedCustomEvents.clear();
     for (auto* customEventData : _currentBeatmapData->customEventDatas) {
@@ -1574,8 +1571,6 @@ private:
       if (GetVivifyDebugLogging()) {
         PaperLogger.info("Vivify catch-up event: type='{}' beat={}", std::string(type), customEventData->time);
       }
-      // Dispatch through the same handler as live events so all state is set up
-      // identically regardless of whether an event fired at song start or not.
       if (type == kInstantiatePrefabEvent) {
         InstantiatePrefab(customEventData, *json);
       } else if (type == kDestroyObjectEvent) {
@@ -1598,10 +1593,14 @@ private:
         HandleSetRenderingSettings(customEventData, *json);
       } else if (type == kAssignObjectPrefabEvent) {
         HandleAssignObjectPrefab(customEventData, *json);
-        // Mark AssignObjectPrefab as applied so the live callback skips it
-        // when BeatmapCallbacksController fires it again on playback.
-        _catchUpAppliedCustomEvents.emplace(customEventData);
+      } else {
+        continue; // unknown — don't mark as applied
       }
+      // Mark every replayed event so HandleCustomEvent skips it when
+      // BeatmapCallbacksController fires it again at the normal beat time.
+      // Without this, InstantiatePrefab would spawn duplicate prefabs, cameras
+      // would be created twice, etc.
+      _catchUpAppliedCustomEvents.emplace(customEventData);
     }
   }
   void ResetRuntime() {

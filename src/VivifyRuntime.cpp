@@ -1775,13 +1775,12 @@ private:
         if (!nameKey.empty() && !_assetsByName.contains(nameKey)) {
           _assetsByName[nameKey] = asset;
         }
-        auto* shader = il2cpp_utils::try_cast<UnityEngine::Shader>(asset).value_or(nullptr);
+        auto* shader = il2cpp_utils::try_cast<UnityEngine::Shader>(asset.unsafePtr()).value_or(nullptr);
         if (IsAlive(shader) && shader->get_isSupported() && !nameKey.empty()) {
           _supportedShadersByName[nameKey] = shader;
         }
       }
-      auto assetPathsIt = _assetPaths.find(asset);
-      if (assetPathsIt == _assetPaths.end()) _assetPaths[asset] = originalAssetPath;
+      if (!key.empty() && !_assetPaths.contains(key)) _assetPaths[key] = originalAssetPath;
     }
   }
   void LoadMainBundle() {

@@ -2237,16 +2237,10 @@ private:
   }
   bool AssignmentMatchesTracks(AssignedPrefabInfo const& info, GlobalNamespace::NoteData* noteData) {
     if (info.tracks.empty()) return true;
-    if (noteData == nullptr) return true; // no noteData = wildcard (e.g. bomb notes)
+    if (noteData == nullptr) return false;
     auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
-    if (customNoteData == nullptr || customNoteData->customData == nullptr) {
-      // NoteData is not custom (e.g. BombNoteController passes plain NoteData).
-      // A track filter cannot be verified, so treat as matched to avoid silently
-      // dropping all track-filtered bomb note assignments.
-      return true;
-    }
+    if (customNoteData == nullptr || customNoteData->customData == nullptr) return false;
     auto& ad = TracksAD::getAD(customNoteData->customData);
-    // Build a hash set of the assigned tracks once so matching is O(n) not O(n*m).
     std::unordered_set<TrackW> assignedSet(info.tracks.begin(), info.tracks.end());
     auto matches = [&](auto const& noteTracks) {
       for (auto const& noteTrack : noteTracks) {
@@ -2255,7 +2249,6 @@ private:
       return false;
     };
     if (matches(ad.tracks)) return true;
-    // Fallback: early notes at song start may not have ad.tracks populated yet.
     if (customNoteData->customData->value.has_value()) {
       bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
       auto parsedTracks = ReadTracks(customNoteData->customData->value.value().get(), v2);
